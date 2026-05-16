@@ -8,8 +8,6 @@ nginx CVE scanner + RCE exploit framework.
 
 Proof of concept for **CVE-2026-42945** — a critical heap buffer overflow in NGINX's `ngx_http_rewrite_module` — plus a scanner covering **17 known nginx CVEs** with automated HTTP probes, fingerprinting, web security auditing, WAF detection/bypass, and report generation.
 
-> Original vulnerability discovered by [depthfirst](https://depthfirst.com)'s security analysis system.
-
 ---
 
 ## Quick Start
