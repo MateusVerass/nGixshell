@@ -277,6 +277,7 @@ CVE_DB = OrderedDict([
         "fixed_in": "1.31.0 / 1.30.1",
         "config_required": ["rewrite"],
         "local_only": False, "probe": None, "exploit": False,
+        "same_advisory_as": "CVE-2026-42945",
         "ref": "https://my.f5.com/manage/s/article/K000160932",
     }),
     ("CVE-2026-40701", {
@@ -286,6 +287,7 @@ CVE_DB = OrderedDict([
         "fixed_in": "1.31.0 / 1.30.1",
         "config_required": [],
         "local_only": False, "probe": None, "exploit": False,
+        "same_advisory_as": "CVE-2026-42945",
         "ref": "https://my.f5.com/manage/s/article/K000160932",
     }),
     ("CVE-2026-42934", {
@@ -295,6 +297,7 @@ CVE_DB = OrderedDict([
         "fixed_in": "1.31.0 / 1.30.1",
         "config_required": [],
         "local_only": False, "probe": None, "exploit": False,
+        "same_advisory_as": "CVE-2026-42945",
         "ref": "https://my.f5.com/manage/s/article/K000160932",
     }),
     ("CVE-2022-41741", {
@@ -857,11 +860,27 @@ def path_discovery(host: str, port: int,
                    extra_paths: list = None) -> list:
     """
     Probe a wordlist of interesting paths. Returns found paths (non-404 status).
+    Uses a random sentinel path to detect catch-all responses (403/301/etc.)
+    and suppresses those status codes from results to avoid false positives.
     """
     paths  = list(INTERESTING_PATHS)
     if extra_paths:
         for p in extra_paths:
             paths.append((p, "custom"))
+
+    # ── Detect catch-all status codes ────────────────────────────────────────
+    # Send a request to a path that cannot exist; any non-404 response means
+    # the server returns that status for ALL unknown paths (catch-all rule).
+    catchall_codes = {404, 502, 503, 504}
+    try:
+        sentinel = f"/ngixshell-probe-{random.randint(100000,999999)}.xyz"
+        s_status, s_hdrs, s_body = _http_get(host, port, sentinel,
+                                              tls=tls, proxy=proxy, timeout=5)
+        if s_status not in (404,):
+            catchall_codes.add(s_status)
+            vlog(f"[v] catch-all detected: {s_status} (will suppress this status in results)")
+    except Exception:
+        pass
 
     found  = []
     log(f"\n[*] Path discovery — {host}:{port} ({len(paths)} paths)")
@@ -876,13 +895,9 @@ def path_discovery(host: str, port: int,
             probe_path = _waf_obfuscate_path(path)
             status, hdrs, body = _http_get(host, port, probe_path,
                                            tls=tls, proxy=proxy, timeout=5)
-            if status == 404:
-                vlog(f"[v] {status} {path}")
-                continue
 
-            # 502/503/504 = proxy/upstream error — file doesn't exist, skip
-            if status in (502, 503, 504):
-                vlog(f"[v] {status} {path} (proxy error — not a real finding)")
+            if status in catchall_codes:
+                vlog(f"[v] {status} {path} (catch-all/proxy error, skipping)")
                 continue
 
             content_type = hdrs.get("content-type", "")
@@ -1405,6 +1420,7 @@ def cve_scan(host: str, port: int, tls: bool = False,
 
     targets  = ({target_cve: CVE_DB[target_cve]} if target_cve else CVE_DB)
     findings = []
+    detected_advisories = set()  # track which advisories already have a confirmed finding
 
     for cve_id, info in targets.items():
         if info.get("local_only"):
@@ -1412,31 +1428,39 @@ def cve_scan(host: str, port: int, tls: bool = False,
         elif version is None:
             status = "UNKNOWN"
         elif _version_in_range(version, info["affected_min"], info["affected_max"]):
-            probe_name = info.get("probe")
-            if probe_name and probe_name in PROBE_REGISTRY:
-                result, msg = _run_probe_with_retry(
-                    PROBE_REGISTRY[probe_name], host, port, tls, proxy)
-                vlog(f"[v] {cve_id}: {msg}")
-                status = ("VULNERABLE" if result is True
-                          else "PROBE-CLEAN" if result is False
-                          else "VERSION-MATCH")
-            elif info.get("exploit"):
-                status = "EXPLOIT-AVAIL"
+            # If this CVE is a sibling of an already-confirmed finding, suppress it
+            parent = info.get("same_advisory_as")
+            if parent and parent in detected_advisories:
+                status = "SAME-ADVISORY"
             else:
-                status = "VERSION-MATCH"
+                probe_name = info.get("probe")
+                if probe_name and probe_name in PROBE_REGISTRY:
+                    result, msg = _run_probe_with_retry(
+                        PROBE_REGISTRY[probe_name], host, port, tls, proxy)
+                    vlog(f"[v] {cve_id}: {msg}")
+                    status = ("VULNERABLE" if result is True
+                              else "PROBE-CLEAN" if result is False
+                              else "VERSION-MATCH")
+                elif info.get("exploit"):
+                    status = "EXPLOIT-AVAIL"
+                else:
+                    status = "VERSION-MATCH"
         else:
             status = "PATCHED"
 
         desc   = info["description"]
         short  = (desc[:57] + "...") if len(desc) > 60 else desc
         marker = ("[!]" if status in ("VULNERABLE", "EXPLOIT-AVAIL")
-                  else "[-]" if status in ("PATCHED", "PROBE-CLEAN")
+                  else "[-]" if status in ("PATCHED", "PROBE-CLEAN", "SAME-ADVISORY")
                   else "[?]")
 
         log(f"  {marker} {cve_id:<16} {info['cvss']:<6} {info['severity']:<10} {status:<20} {short}")
 
-        if status not in ("PATCHED", "LOCAL-ONLY", "PROBE-CLEAN"):
+        if status in ("VULNERABLE", "EXPLOIT-AVAIL", "VERSION-MATCH"):
             findings.append((cve_id, info, status))
+            detected_advisories.add(cve_id)
+            if info.get("same_advisory_as"):
+                detected_advisories.add(info["same_advisory_as"])
 
     log("─" * 96)
 
