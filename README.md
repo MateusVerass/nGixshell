@@ -66,7 +66,7 @@ TARGET formats:
 | `--upgrade-shell` | Auto-send PTY upgrade after shell connects |
 | `--subdomain-scan DOMAIN` | Find vulnerable nginx on subdomains |
 | `--cve CVE-ID` | Test one specific CVE |
-| `--list-cves` | Print all 17 CVEs with CVSS and probe info |
+| `--list-cves` | Print all 53 CVEs with CVSS and probe info |
 | `--list-candidates` | Print heap address candidates |
 | `--dry-run` | Fingerprint + scan only, no exploit |
 | `--target-file FILE` | Scan multiple hosts from a file |
@@ -162,11 +162,47 @@ Runs automatically in scan mode. All modules can be skipped individually.
 | CVE-2013-4547 | 7.5 HIGH | URI space+NUL bypass | HTTP probe |
 | CVE-2013-2028 | 7.5 HIGH | Chunked encoding stack overflow | HTTP probe |
 | CVE-2009-2629 | 7.5 HIGH | Buffer underflow in URI parsing | version |
+| CVE-2026-27784 | 7.5 HIGH | Buffer overflow in mp4 module | version |
+| CVE-2026-32647 | 7.5 HIGH | Buffer overflow in mp4 module (sibling) | version |
+| CVE-2024-24990 | 7.5 HIGH | Use-after-free in HTTP/3 QUIC module | version |
+| CVE-2024-24989 | 7.5 HIGH | NULL pointer dereference in HTTP/3 | version |
+| CVE-2024-31079 | 7.5 HIGH | Stack overflow in HTTP/3 QUIC encoder | version |
+| CVE-2024-32760 | 7.5 HIGH | Buffer overwrite in HTTP/3 QUIC | version |
+| CVE-2016-0746 | 7.5 HIGH | Use-after-free in resolver (RCE) | version |
+| CVE-2014-0133 | 7.5 HIGH | Heap overflow in SPDY implementation | version |
+| CVE-2014-0088 | 7.5 HIGH | Memory corruption in SPDY | version |
+| CVE-2012-1180 | 7.5 HIGH | Use-after-free in proxy module | version |
+| CVE-2009-3555 | 7.5 HIGH | TLS renegotiation injection (MITM) | version |
 | CVE-2012-2089 | 6.8 MEDIUM | Buffer overflow in mp4 module | version |
+| CVE-2026-42926 | 6.5 MEDIUM | HTTP/2 request splitting via proxy | version |
+| CVE-2026-27654 | 6.5 MEDIUM | Heap overflow in WebDAV module | version |
+| CVE-2026-28753 | 6.5 MEDIUM | Header injection in mail proxy | version |
+| CVE-2026-1642 | 6.5 MEDIUM | SSL upstream session reuse leak | version |
+| CVE-2019-9511 | 6.5 MEDIUM | HTTP/2 Data Dribble DoS | version |
 | CVE-2019-20372 | 5.3 MEDIUM | HTTP request smuggling | HTTP probe |
+| CVE-2026-40460 | 5.3 MEDIUM | HTTP/3 QUIC connection spoofing | version |
+| CVE-2026-28755 | 5.3 MEDIUM | Memory disclosure in OCSP processing | version |
+| CVE-2024-35200 | 5.3 MEDIUM | NULL pointer dereference in HTTP/3 | version |
+| CVE-2024-34161 | 5.3 MEDIUM | Memory disclosure in HTTP/3 | version |
+| CVE-2013-2070 | 5.3 MEDIUM | Backend response disclosure via proxy | version |
+| CVE-2016-4450 | 5.3 MEDIUM | NULL pointer dereference via chunked body | version |
+| CVE-2016-0742 | 5.0 MEDIUM | Invalid pointer dereference in resolver | version |
+| CVE-2016-0747 | 5.0 MEDIUM | Insufficient CNAME resolution limit | version |
 | CVE-2011-4963 | 5.0 MEDIUM | IPv6 literal access bypass | HTTP probe |
 | CVE-2009-3896 | 5.0 MEDIUM | NULL pointer dereference DoS | version |
+| CVE-2014-3556 | 5.0 MEDIUM | STARTTLS command injection in mail | version |
+| CVE-2018-16845 | 5.5 MEDIUM | Integer underflow in mp4 module | version |
+| CVE-2025-23419 | 5.3 MEDIUM | TLS session resumption cert bypass | version |
+| CVE-2025-53859 | 4.3 MEDIUM | Mail SMTP command injection | version |
 | CVE-2014-3616 | 4.3 MEDIUM | TLS SNI virtual host confusion | version |
+| CVE-2024-7347 | 4.7 MEDIUM | Out-of-bounds read in mp4 module | version |
+| CVE-2026-27651 | 4.3 MEDIUM | NULL pointer dereference in mail proxy | version |
+| CVE-2019-9513 | 4.3 MEDIUM | HTTP/2 Resource Loop DoS | version |
+| CVE-2019-9516 | 4.3 MEDIUM | HTTP/2 0-Length Headers memory exhaustion | version |
+| CVE-2018-16843 | 4.3 MEDIUM | Excessive memory in HTTP/2 | version |
+| CVE-2018-16844 | 4.3 MEDIUM | Excessive CPU in HTTP/2 SETTINGS | version |
+| CVE-2009-3898 | 4.9 MEDIUM | Directory traversal in WebDAV | version |
+| CVE-2011-4315 | 5.0 MEDIUM | Heap overflow in resolver | version |
 
 ---
 

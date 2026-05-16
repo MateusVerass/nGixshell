@@ -47,9 +47,9 @@
         letter-spacing="1">nginx CVE Scanner  +  RCE Exploit Framework</text>
 
   <!-- Tags row -->
-  <!-- Tag: 17 CVEs -->
+  <!-- Tag: 53 CVEs -->
   <rect x="135" y="165" width="88" height="24" rx="4" fill="#00e676" fill-opacity="0.12" stroke="#00e676" stroke-width="1" stroke-opacity="0.5"/>
-  <text x="179" y="182" font-family="monospace" font-size="12" fill="#00e676" text-anchor="middle">17 CVEs</text>
+  <text x="179" y="182" font-family="monospace" font-size="12" fill="#00e676" text-anchor="middle">53 CVEs</text>
 
   <!-- Tag: CVE-2026-42945 -->
   <rect x="237" y="165" width="160" height="24" rx="4" fill="#ff4444" fill-opacity="0.10" stroke="#ff4444" stroke-width="1" stroke-opacity="0.5"/>
