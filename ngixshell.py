@@ -1491,14 +1491,22 @@ def cve_scan(host: str, port: int, tls: bool = False,
 
 def wait_alive(host: str, port: int, timeout: int = 30,
                tls: bool = False, proxy: str = None) -> bool:
-    for _ in range(timeout):
+    req = (f"GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").encode()
+    for attempt_n in range(timeout):
         try:
-            s = _connect(host, port, timeout=2, tls=tls, proxy=proxy)
-            s.sendall(b"GET / HTTP/1.1\r\nHost:l\r\nConnection:close\r\n\r\n")
-            s.recv(100)
+            s = _connect(host, port, timeout=5, tls=tls, proxy=proxy)
+            s.sendall(req)
+            s.settimeout(5)
+            data = s.recv(16)
             s.close()
-            return True
+            # Any HTTP response (even 4xx/5xx) means nginx is alive
+            if data:
+                return True
+        except (ConnectionRefusedError, OSError):
+            pass
         except Exception:
+            pass
+        if attempt_n < timeout - 1:
             _sleep(1)
     return False
 
