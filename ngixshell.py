@@ -730,19 +730,121 @@ def _version_in_range(v: tuple, vmin: tuple, vmax: tuple) -> bool:
 
 # ─── Target fingerprint ───────────────────────────────────────────────────────
 
+def _detect_nginx_passive(headers: dict, body: bytes) -> tuple:
+    """
+    Detect nginx presence without relying on the Server header.
+    Returns (is_nginx: bool, evidence: str, version: tuple|None).
+
+    Techniques used:
+    1. Server header (direct)
+    2. Nginx error page signature in body
+    3. ETag format: nginx uses "<hex>-<hex>"
+    4. X-Accel-* headers (nginx upstream headers)
+    5. Bad-request response (nginx returns specific 400 page)
+    6. Header casing: nginx sends lowercase header names
+    """
+    server  = headers.get("server", "")
+    version = _parse_version(server)
+
+    # 1 — Server header has nginx
+    if "nginx" in server.lower():
+        return True, f"Server: {server}", version
+
+    # 2 — nginx signature in body HTML (error pages, default page)
+    body_text = body.decode("latin-1", errors="replace").lower()
+    if "<center>nginx</center>" in body_text or "<hr><center>nginx" in body_text:
+        ver = _parse_version(body_text)
+        return True, "nginx signature in page body", ver
+
+    # 3 — ETag format: nginx generates "<size_hex>-<mtime_hex>" e.g. "6537cac7-267"
+    etag = headers.get("etag", "")
+    if re.match(r'"[0-9a-f]+-[0-9a-f]+"', etag):
+        return True, f"nginx-style ETag: {etag}", None
+
+    # 4 — nginx upstream / accel headers
+    for h in ("x-accel-redirect", "x-accel-buffering", "x-accel-charset"):
+        if h in headers:
+            return True, f"nginx header present: {h}", None
+
+    # 5 — Via header contains nginx
+    via = headers.get("via", "")
+    if "nginx" in via.lower():
+        ver = _parse_version(via)
+        return True, f"Via: {via}", ver
+
+    return False, "", None
+
+
 def fingerprint_target(host: str, port: int,
                        tls: bool = False, proxy: str = None) -> dict:
     info: dict = {"host": host, "port": port, "tls": tls}
     try:
-        headers = _http_head(host, port, tls=tls, proxy=proxy)
+        # Use GET (not HEAD) so we get the body for passive fingerprinting
+        status, headers, body = _http_get(host, port, "/", tls=tls, proxy=proxy, timeout=5)
         server  = headers.get("server", "")
         info["server_header"] = server
-        info["status_code"]   = headers.get("status_code", 0)
+        info["status_code"]   = status
+        info["via"]           = headers.get("via", "")
+
+        # Direct version from Server header
         version = _parse_version(server)
+
+        # Passive fingerprinting if Server header doesn't reveal nginx
+        is_nginx, evidence, passive_ver = _detect_nginx_passive(headers, body)
+
+        if not version and passive_ver:
+            version = passive_ver
+
         info["version"]       = ".".join(str(x) for x in version) if version else None
         info["version_tuple"] = version
         info["nginx_plus"]    = "nginx-plus" in server.lower()
-        info["via"]           = headers.get("via", "")
+        info["is_nginx"]      = is_nginx or bool(version)
+        info["fp_evidence"]   = evidence if evidence else (server or "(none)")
+
+        # If server_tokens off, try fetching a non-existent path to get the
+        # nginx 404 error page which always contains the nginx signature
+        if not info["is_nginx"]:
+            try:
+                _, _, err_body = _http_get(host, port,
+                    f"/ngixshell-fp-{random.randint(10000,99999)}.html",
+                    tls=tls, proxy=proxy, timeout=5)
+                is_n2, ev2, ver2 = _detect_nginx_passive({}, err_body)
+                if is_n2:
+                    info["is_nginx"]    = True
+                    info["fp_evidence"] = ev2
+                    if ver2 and not version:
+                        version = ver2
+                        info["version"]       = ".".join(str(x) for x in ver2)
+                        info["version_tuple"] = ver2
+            except Exception:
+                pass
+
+        # Also try a bad request to trigger nginx's 400 page
+        if not info["is_nginx"]:
+            try:
+                s = _connect(host, port, timeout=5, tls=tls, proxy=proxy)
+                s.sendall(b"GET \x00 HTTP/1.0\r\n\r\n")
+                s.settimeout(3)
+                bad_raw = b""
+                try:
+                    while len(bad_raw) < 2048:
+                        chunk = s.recv(512)
+                        if not chunk: break
+                        bad_raw += chunk
+                except Exception:
+                    pass
+                s.close()
+                _, _, bad_body = _parse_response(bad_raw)
+                is_n3, ev3, ver3 = _detect_nginx_passive({}, bad_raw)
+                if is_n3:
+                    info["is_nginx"]    = True
+                    info["fp_evidence"] = ev3 + " (bad-request probe)"
+                    if ver3 and not version:
+                        version = ver3
+                        info["version"]       = ".".join(str(x) for x in ver3)
+                        info["version_tuple"] = ver3
+            except Exception:
+                pass
 
         if tls:
             try:
@@ -766,7 +868,9 @@ def fingerprint_target(host: str, port: int,
     log(f"\n{'─'*60}")
     log(f"  Fingerprint  {host}:{port}")
     log(f"{'─'*60}")
-    log(f"  Server  : {info.get('server_header') or '(none)'}")
+    log(f"  Server  : {info.get('server_header') or '(hidden)'}")
+    log(f"  nginx   : {'YES' if info.get('is_nginx') else 'not detected'}"
+        + (f"  [{info['fp_evidence']}]" if info.get('fp_evidence') and not info.get('server_header') else ""))
     log(f"  Version : {info.get('version') or 'unknown'}")
     log(f"  Plus    : {'yes' if info.get('nginx_plus') else 'no'}")
     if info.get("tls_cn"):
@@ -784,16 +888,20 @@ def check_target(host: str, port: int,
     scheme = "https" if tls else "http"
     log(f"[*] Checking {scheme}://{host}:{port} ...")
     try:
-        headers = _http_head(host, port, tls=tls, proxy=proxy)
+        status, headers, body = _http_get(host, port, "/", tls=tls, proxy=proxy, timeout=5)
         server  = headers.get("server", "")
-        if not server:
-            log("[-] No Server header")
+        is_nginx, evidence, version = _detect_nginx_passive(headers, body)
+
+        if not is_nginx:
+            log("[-] nginx not detected (Server header hidden or not nginx)")
             return False, None
-        log(f"[+] Server: {server}")
-        version = _parse_version(server)
+
+        log(f"[+] Server: {server or '(hidden)'}  [{evidence}]")
+
         if version is None:
-            log("[-] Not nginx or version not exposed")
-            return False, None
+            log("[?] nginx detected but version unknown — scanning all CVEs")
+            return True, None
+
         ver_str = ".".join(str(x) for x in version)
         if _version_in_range(version, VULN_MIN, VULN_MAX):
             log(f"[!] nginx {ver_str} — VULNERABLE RANGE "
