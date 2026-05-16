@@ -23,9 +23,11 @@ import json
 import random
 import re
 import select
+import shutil
 import socket
 import ssl
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -2135,6 +2137,28 @@ def attempt(host, port, target_bytes, body, n_spray, body_len, tls, proxy,
 
 # ─── Subdomain scanner ────────────────────────────────────────────────────────
 
+def _run_subfinder(domain: str, timeout: float = 60.0) -> list:
+    """Run subfinder passively and return list of discovered subdomains."""
+    if not shutil.which("subfinder"):
+        return []
+    try:
+        result = subprocess.run(
+            ["subfinder", "-d", domain, "-silent", "-all"],
+            capture_output=True, text=True, timeout=timeout
+        )
+        subs = []
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line and line.endswith(f".{domain}"):
+                # strip the base domain to get just the subdomain prefix
+                prefix = line[: -(len(domain) + 1)]
+                if prefix:
+                    subs.append(prefix)
+        return subs
+    except Exception:
+        return []
+
+
 def _probe_subdomain(fqdn, port, tls, proxy, timeout):
     try:
         socket.getaddrinfo(fqdn, port, socket.AF_INET)
@@ -2153,15 +2177,31 @@ def _probe_subdomain(fqdn, port, tls, proxy, timeout):
 
 
 def subdomain_scan(domain, wordlist, port=80, tls=False,
-                   proxy=None, n_threads=20, timeout=5.0):
-    log(f"[*] Subdomain scan: {domain} | {len(wordlist)} words | {n_threads} threads")
+                   proxy=None, n_threads=20, timeout=5.0, use_subfinder=False):
+    all_subs = list(wordlist)
+
+    if use_subfinder:
+        log(f"[*] Running subfinder against {domain} ...")
+        sf_subs = _run_subfinder(domain, timeout=60.0)
+        if sf_subs:
+            log(f"[+] subfinder found {len(sf_subs)} subdomains")
+            # merge without duplicates, preserving order
+            existing = set(all_subs)
+            for s in sf_subs:
+                if s not in existing:
+                    all_subs.append(s)
+                    existing.add(s)
+        else:
+            log("[!] subfinder returned no results (not installed or no output)")
+
+    log(f"[*] Subdomain scan: {domain} | {len(all_subs)} candidates | {n_threads} threads")
     log("─" * 68)
     log(f"  {'STATUS':<10} {'HOST':<42} SERVER")
     log("─" * 68)
     results = []
     with ThreadPoolExecutor(max_workers=n_threads) as ex:
         futures = {}
-        for sub in wordlist:
+        for sub in all_subs:
             if _rate_limiter: _rate_limiter.acquire()
             futures[ex.submit(_probe_subdomain, f"{sub}.{domain}", port, tls, proxy, timeout)] = sub
         for fut in as_completed(futures):
@@ -2618,6 +2658,8 @@ Usage examples
     # ── Subdomain scan ────────────────────────────────────────────────────────
     sd = parser.add_argument_group("subdomain scan")
     sd.add_argument("--wordlist",     metavar="FILE")
+    sd.add_argument("--subfinder",    action="store_true",
+                    help="use subfinder (passive OSINT) to discover subdomains before probing")
     sd.add_argument("--scan-port",    type=int,   default=80)
     sd.add_argument("--scan-tls",     action="store_true")
     sd.add_argument("--scan-threads", type=int,   default=20)
@@ -2682,7 +2724,8 @@ Usage examples
                 with open(args.wordlist) as f:
                     wl = [l.strip() for l in f if l.strip()]
             subdomain_scan(args.subdomain_scan, wl, port=args.scan_port, tls=args.scan_tls,
-                           proxy=args.proxy, n_threads=args.scan_threads, timeout=args.scan_timeout)
+                           proxy=args.proxy, n_threads=args.scan_threads, timeout=args.scan_timeout,
+                           use_subfinder=args.subfinder)
             return 0
 
         # ── Build target list ─────────────────────────────────────────────────
