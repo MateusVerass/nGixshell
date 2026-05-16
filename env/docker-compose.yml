@@ -2,9 +2,9 @@ services:
   nginx:
     build: .
     cap_add:
-      - SYS_PTRACE
+      - SYS_PTRACE     # allows gdb/strace to inspect the worker process post-crash
     security_opt:
-      - seccomp=unconfined
+      - seccomp=unconfined  # required: default seccomp profile blocks personality(2) used by setarch -R (ASLR disable)
     init: true
     ports:
       - "19321:19321"

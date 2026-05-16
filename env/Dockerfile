@@ -1,3 +1,5 @@
+# Pin to a specific digest for full reproducibility:
+#   docker pull ubuntu:22.04 && docker inspect ubuntu:22.04 --format '{{index .RepoDigests 0}}'
 FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 

@@ -4,10 +4,19 @@ import http.server
 import time
 import socketserver
 
+MAX_DELAY = 120.0
+
+
+def _parse_delay(headers, default=5.0):
+    try:
+        return min(float(headers.get('X-Delay', default)), MAX_DELAY)
+    except (ValueError, TypeError):
+        return default
+
+
 class BackendHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        delay = float(self.headers.get('X-Delay', '5'))
-        time.sleep(delay)
+        time.sleep(_parse_delay(self.headers))
         self.send_response(200)
         self.send_header('Content-Type', 'text/plain')
         self.end_headers()
@@ -16,8 +25,7 @@ class BackendHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get('Content-Length', 0))
         self.rfile.read(length)
-        delay = float(self.headers.get('X-Delay', '5'))
-        time.sleep(delay)
+        time.sleep(_parse_delay(self.headers))
         self.send_response(200)
         self.send_header('Content-Type', 'text/plain')
         self.end_headers()
@@ -25,6 +33,7 @@ class BackendHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         pass
+
 
 socketserver.TCPServer.allow_reuse_address = True
 with socketserver.TCPServer(("127.0.0.1", 19323), BackendHandler) as httpd:
