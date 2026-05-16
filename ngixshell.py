@@ -961,7 +961,7 @@ _STATUS_COLOR = {
 
 def generate_html_report(host, port, findings, fingerprint=None,
                          elapsed=0.0, path="ngixshell_report.html"):
-    ts   = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    ts   = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     rows = ""
     for cve_id, info, status in findings:
         sc = _STATUS_COLOR.get(status, "#888")
@@ -1003,7 +1003,7 @@ Generated: {ts} &nbsp;|&nbsp; Elapsed: {elapsed:.1f}s &nbsp;|&nbsp; Findings: {l
 def _build_json_output(host, port, findings, fingerprint=None, elapsed=0.0):
     out = {
         "tool":      "nGixShell",
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
         "target":    {"host": host, "port": port},
         "elapsed_s": round(elapsed, 2),
         "findings":  [],
@@ -1343,7 +1343,7 @@ Usage examples
         # Auto HTML report when findings exist (unless --no-report)
         html_path = args.html_report
         if not html_path and not args.no_report and all_findings:
-            ts        = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            ts        = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
             html_path = f"ngixshell_{h0}_{ts}.html"
 
         if html_path:
