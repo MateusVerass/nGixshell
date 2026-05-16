@@ -880,6 +880,11 @@ def path_discovery(host: str, port: int,
                 vlog(f"[v] {status} {path}")
                 continue
 
+            # 502/503/504 = proxy/upstream error — file doesn't exist, skip
+            if status in (502, 503, 504):
+                vlog(f"[v] {status} {path} (proxy error — not a real finding)")
+                continue
+
             content_type = hdrs.get("content-type", "")
             marker = "[!]" if status == 200 else "[~]"
             log(f"  {marker} {status:<6}   {path:<40} {note}")
@@ -984,17 +989,23 @@ def vhost_enum(host: str, port: int,
             size = len(body)
             ct   = hdrs.get("content-type", "")
 
-            # Flag if meaningfully different from baseline
-            different = (status != baseline_status or
-                         abs(size - baseline_len) > 50 or
-                         ct != baseline_ct)
+            # Flag if meaningfully different from baseline.
+            # Identical size across ALL probes = default server block, not a real vhost.
+            size_diff   = abs(size - baseline_len)
+            status_diff = status != baseline_status
+            # require both status AND body to differ, or a significant body difference
+            different = status_diff and size_diff > 100
+            if not different and size_diff > 500 and ct != baseline_ct:
+                different = True  # different content-type with large body change
+
             if different:
-                note = f"status differs" if status != baseline_status else f"body differs ({size} vs {baseline_len}b)"
+                note = (f"status {baseline_status}→{status}, body {baseline_len}→{size}b"
+                        if status_diff else f"body differs ({size} vs {baseline_len}b)")
                 log(f"  [!] {vhost:<35} {status:<8} {size:<10} {note}")
                 found.append({"vhost": vhost, "status": status, "size": size,
                               "content_type": ct, "note": note})
             else:
-                vlog(f"[v] {vhost}: same as baseline")
+                vlog(f"[v] {vhost}: same as baseline (default server block)")
         except Exception as e:
             vlog(f"[v] vhost {vhost}: {e}")
 
@@ -1022,12 +1033,15 @@ def tls_audit(host: str, port: int, proxy: str = None) -> dict:
 
     for proto_name in proto_tests:
         try:
+            import warnings
             ver    = getattr(ssl.TLSVersion, proto_name)
             ctx    = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx.check_hostname = False
             ctx.verify_mode    = ssl.CERT_NONE
-            ctx.minimum_version = ver
-            ctx.maximum_version = ver
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                ctx.minimum_version = ver
+                ctx.maximum_version = ver
             raw = socket.create_connection((host, port), timeout=4)
             ts  = ctx.wrap_socket(raw, server_hostname=host)
             ts.close()
