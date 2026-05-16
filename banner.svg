@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 220">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0d1117"/>
+      <stop offset="100%" style="stop-color:#161b22"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%"   style="stop-color:#00c853"/>
+      <stop offset="50%"  style="stop-color:#00e676"/>
+      <stop offset="100%" style="stop-color:#00c853"/>
+    </linearGradient>
+    <filter id="blur">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="860" height="220" rx="10" fill="url(#bg)"/>
+  <!-- Border -->
+  <rect width="858" height="218" rx="10" x="1" y="1" fill="none" stroke="#00e676" stroke-width="1.5" stroke-opacity="0.4"/>
+
+  <!-- Top-left corner bracket -->
+  <text x="22" y="42" font-family="monospace" font-size="20" fill="#00e676" opacity="0.6">╔═══</text>
+  <!-- Bottom-right corner bracket -->
+  <text x="756" y="200" font-family="monospace" font-size="20" fill="#00e676" opacity="0.6">═══╝</text>
+
+  <!-- Main title -->
+  <text x="430" y="100"
+        font-family="'Courier New', Courier, monospace"
+        font-size="72"
+        font-weight="bold"
+        fill="url(#glow)"
+        filter="url(#blur)"
+        text-anchor="middle"
+        letter-spacing="4">nGixShell</text>
+
+  <!-- Divider line -->
+  <line x1="60" y1="120" x2="800" y2="120" stroke="#00e676" stroke-width="1" stroke-opacity="0.3"/>
+
+  <!-- Subtitle -->
+  <text x="430" y="150"
+        font-family="'Courier New', Courier, monospace"
+        font-size="15"
+        fill="#8b949e"
+        text-anchor="middle"
+        letter-spacing="1">nginx CVE Scanner  +  RCE Exploit Framework</text>
+
+  <!-- Tags row -->
+  <!-- Tag: 17 CVEs -->
+  <rect x="135" y="165" width="88" height="24" rx="4" fill="#00e676" fill-opacity="0.12" stroke="#00e676" stroke-width="1" stroke-opacity="0.5"/>
+  <text x="179" y="182" font-family="monospace" font-size="12" fill="#00e676" text-anchor="middle">17 CVEs</text>
+
+  <!-- Tag: CVE-2026-42945 -->
+  <rect x="237" y="165" width="160" height="24" rx="4" fill="#ff4444" fill-opacity="0.10" stroke="#ff4444" stroke-width="1" stroke-opacity="0.5"/>
+  <text x="317" y="182" font-family="monospace" font-size="12" fill="#ff6b6b" text-anchor="middle">CVE-2026-42945</text>
+
+  <!-- Tag: Python 3 -->
+  <rect x="411" y="165" width="82" height="24" rx="4" fill="#3572a5" fill-opacity="0.15" stroke="#3572a5" stroke-width="1" stroke-opacity="0.5"/>
+  <text x="452" y="182" font-family="monospace" font-size="12" fill="#6fa8dc" text-anchor="middle">Python 3</text>
+
+  <!-- Tag: RCE -->
+  <rect x="507" y="165" width="52" height="24" rx="4" fill="#ff6600" fill-opacity="0.12" stroke="#ff6600" stroke-width="1" stroke-opacity="0.5"/>
+  <text x="533" y="182" font-family="monospace" font-size="12" fill="#ff9944" text-anchor="middle">RCE</text>
+
+  <!-- Tag: by Mateus Veras -->
+  <rect x="573" y="165" width="148" height="24" rx="4" fill="#8957e5" fill-opacity="0.12" stroke="#8957e5" stroke-width="1" stroke-opacity="0.5"/>
+  <text x="647" y="182" font-family="monospace" font-size="12" fill="#b392f0" text-anchor="middle">by Mateus Veras</text>
+</svg>

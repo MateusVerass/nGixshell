@@ -4,6 +4,19 @@ nGixShell — nginx CVE scanner + RCE exploit framework
 Proof of concept for CVE-2026-42945 and 16 other nginx vulnerabilities.
 Heap buffer overflow in ngx_http_rewrite_module (nginx 0.6.27 – 1.30.0)
 """
+
+BANNER = r"""
+╔════════════════════════════════════════════════════════╗
+║          _______      _____ __         ____            ║
+║   ____  / ____(_)  __/ ___// /_  ___  / / /           ║
+║  / __ \/ / __/ / |/_/\__ \/ __ \/ _ \/ / /            ║
+║ / / / / /_/ / />  < ___/ / / / /  __/ / /             ║
+║/_/ /_/\____/_/_/|_|/____/_/ /_/\___/_/_/              ║
+╠════════════════════════════════════════════════════════╣
+║  nginx CVE Scanner + RCE Exploit Framework             ║
+║  17 CVEs  ·  CVE-2026-42945  ·  by Mateus Veras        ║
+╚════════════════════════════════════════════════════════╝
+"""
 import argparse
 import re
 import select
@@ -1010,6 +1023,8 @@ def main() -> int:
                         help="print debug info including caught exceptions")
 
     args = parser.parse_args()
+
+    print(BANNER)
 
     # Validate --cve argument against database
     if args.cve and args.cve not in CVE_DB:

@@ -1,4 +1,8 @@
-# nGixShell
+<div align="center">
+  <img src="banner.svg" alt="nGixShell" width="100%"/>
+</div>
+
+---
 
 nginx CVE scanner + RCE exploit framework.
 
