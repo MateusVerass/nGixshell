@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+ngixshell_*.html
+*.log
+.DS_Store
