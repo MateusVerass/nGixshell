@@ -1998,9 +1998,7 @@ Usage examples
     ou.add_argument("--json",        action="store_true", help="print JSON summary")
     ou.add_argument("--html-report", metavar="FILE", nargs="?",
                     const="ngixshell_report.html",
-                    help="save HTML report (default: ngixshell_report.html)")
-    ou.add_argument("--no-report",   action="store_true",
-                    help="skip auto HTML report")
+                    help="generate HTML report (optional filename, default: ngixshell_report.html)")
     ou.add_argument("--verbose",     action="store_true")
 
     args = parser.parse_args()
@@ -2251,18 +2249,11 @@ Usage examples
                 obj["all_targets"] = [{"host": h, "port": p} for h, p, _ in raw_targets]
             print(json.dumps(obj, indent=2, ensure_ascii=False))
 
-        # Auto HTML report
-        has_issues = bool(all_findings or
-                          (wa0 and (wa0.get("header_issues") or
-                                    wa0.get("paths_found") or
-                                    wa0.get("vhosts_found") or
-                                    wa0.get("tls_result", {}).get("issues"))))
-        html_path = args.html_report
-        if not html_path and not args.no_report and has_issues:
-            ts        = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-            html_path = f"ngixshell_{h0}_{ts}.html"
-
-        if html_path:
+        if args.html_report:
+            html_path = args.html_report
+            if html_path == "ngixshell_report.html":
+                ts        = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+                html_path = f"ngixshell_{h0}_{ts}.html"
             generate_html_report(h0, p0, all_findings, fp0, wa0, elapsed, html_path)
 
         return 0 if not all_findings else 1
