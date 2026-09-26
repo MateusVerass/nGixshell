@@ -13,7 +13,7 @@
 
 ---
 
-**nGixShell** is an nginx CVE scanner and RCE exploit framework. It ships a proof-of-concept for **CVE-2026-42945** (CVSS 3.1 **8.1 HIGH** per F5/NVD) — a heap buffer overflow in `ngx_http_rewrite_module` — and a scanner covering **53 nginx CVEs** with automated HTTP probes, fingerprinting, WAF detection/bypass, web security auditing, and report generation.
+**nGixShell** is an nginx CVE scanner and RCE exploit framework. It ships a proof-of-concept for **CVE-2026-42945** (CVSS 3.1 **8.1 HIGH** per F5/NVD) — a heap buffer overflow in `ngx_http_rewrite_module` — and a scanner covering **61 nginx CVEs** with automated HTTP probes, fingerprinting, WAF detection/bypass, web security auditing, and report generation.
 
 Zero external dependencies. Pure Python 3 stdlib.
 
@@ -91,7 +91,7 @@ TARGET formats:
 | `--verify-url URL` | After a detected crash, fetch URL to confirm the command ran (200 = verified) |
 | `--subdomain-scan DOMAIN` | Find vulnerable nginx on subdomains |
 | `--cve CVE-ID` | Test one specific CVE |
-| `--list-cves` | Print all 53 CVEs with CVSS and probe info |
+| `--list-cves` | Print all 61 CVEs with CVSS and probe info |
 | `--list-candidates` | Print heap address candidates |
 | `--dry-run` | Fingerprint + scan only, no exploit |
 | `--target-file FILE` | Scan multiple hosts from a file |
@@ -189,11 +189,73 @@ pool cleanup pointer — not that code executed.
 
 ## CVE Coverage
 
-53 entries spanning 2009–2026. Scores reflect CVSS v3.1 base metrics from
+61 entries spanning 2009–2026. Scores reflect CVSS v3.1 base metrics from
 NVD/F5 advisories at the time of writing (verify before relying on them for triage).
+Ranges follow <https://nginx.org/en/security_advisories.html>.
 
 | CVE | CVSS | Component | Description |
 |---|---|---|---|
+| CVE-2026-42945 | 8.1 HIGH | rewrite | Heap overflow → RCE with ASLR off (**exploited**) |
+| CVE-2026-9256 | 8.1 HIGH | rewrite | Overlapping PCRE captures → buffer overflow |
+| CVE-2026-42533 | 8.1 HIGH | map/stream | Regex capture heap overflow (ssl_preread) |
+| CVE-2026-60005 | 8.2 HIGH | slice | Memory disclosure (slice + unnamed captures) |
+| CVE-2026-42530 | 8.1 HIGH | HTTP/3 | Heap use-after-free (encoder stream pool) |
+| CVE-2026-42055 | 8.1 HIGH | proxy_v2/grpc | Buffer overflow (proxy_http_version 2 / grpc_pass) |
+| CVE-2026-42946 | 6.5 MEDIUM | scgi/uwsgi | Excessive memory allocation / over-read |
+| CVE-2026-90439 | 6.5 MEDIUM | HTTP/3 | Limited heap overflow (OpenSSL ≤ 3.5.0) |
+| CVE-2026-56434 | 6.5 MEDIUM | SSI | Use-after-free (SSI + proxy_pass + buffering off) |
+| CVE-2026-42926 | 5.8 MEDIUM | HTTP/2 | Frame-header injection (proxy_set_body) |
+| CVE-2026-48142 | 4.8 MEDIUM | charset | Buffer over-read (source_charset utf-8 + charset) |
+| CVE-2026-42934 | 4.8 MEDIUM | charset | Buffer over-read |
+| CVE-2026-40701 | 4.8 MEDIUM | SSL | Resolver use-after-free in OCSP |
+| CVE-2026-40460 | 6.5 MEDIUM | HTTP/3 | QUIC address spoofing |
+| CVE-2026-27654 | 8.2 HIGH | WebDAV | Heap overflow in DAV module |
+| CVE-2026-27784 | 7.8 HIGH | mp4 | Buffer overflow |
+| CVE-2026-32647 | 7.8 HIGH | mp4 | Buffer overflow |
+| CVE-2026-27651 | 7.5 HIGH | mail | NULL pointer (CRAM-MD5/APOP) |
+| CVE-2026-28753 | 3.7 LOW | mail | auth_http/XCLIENT injection |
+| CVE-2026-28755 | 5.4 MEDIUM | stream SSL | OCSP result bypass |
+| CVE-2026-1642 | 5.9 MEDIUM | proxy | SSL upstream injection |
+| CVE-2022-41741 | 7.0 HIGH | mp4 | Worker memory corruption (local file) |
+| CVE-2022-41742 | 7.1 HIGH | mp4 | Worker crash / memory disclosure (local file) |
+| CVE-2021-23017 | 7.7 HIGH | resolver | 1-byte heap overwrite via forged DNS |
+| CVE-2017-7529 | 7.5 HIGH | range filter | Integer overflow → out-of-bounds read |
+| CVE-2019-9511 | 7.5 HIGH | HTTP/2 | Data Dribble CPU/memory DoS |
+| CVE-2019-9513 | 7.5 HIGH | HTTP/2 | Resource Loop CPU DoS |
+| CVE-2018-16843 | 7.5 HIGH | HTTP/2 | Excessive memory consumption |
+| CVE-2018-16844 | 7.5 HIGH | HTTP/2 | Excessive CPU usage |
+| CVE-2016-0746 | 9.8 CRITICAL | resolver | Use-after-free (CNAME) — crash / RCE |
+| CVE-2016-0742 | 7.5 HIGH | resolver | Invalid pointer via crafted DNS |
+| CVE-2016-4450 | 7.5 HIGH | core | NULL pointer writing request body |
+| CVE-2016-1247 | 7.8 HIGH | packaging | Log symlink privesc (local) |
+| CVE-2016-0747 | 5.3 MEDIUM | resolver | CNAME limit → cache poisoning |
+| CVE-2014-0133 | 7.5 HIGH | SPDY | Heap overflow (RCE) |
+| CVE-2014-0088 | 7.5 HIGH | SPDY | Memory corruption (32-bit, RCE) |
+| CVE-2014-3556 | 5.0 MEDIUM | mail | STARTTLS plaintext injection |
+| CVE-2014-3616 | 4.3 MEDIUM | SSL | SNI session confusion |
+| CVE-2013-2028 | 7.5 HIGH | core | Chunked stack overflow (RCE) |
+| CVE-2013-4547 | 7.5 HIGH | core | Space in URI bypass |
+| CVE-2013-2070 | 5.3 MEDIUM | proxy | Backend response disclosure |
+| CVE-2012-1180 | 7.5 HIGH | proxy | UAF disclosure |
+| CVE-2012-2089 | 6.8 MEDIUM | mp4 | Buffer overflow via mp4 |
+| CVE-2011-4315 | 5.0 MEDIUM | resolver | Heap overflow via DNS response |
+| CVE-2011-4963 | 5.0 MEDIUM | access | Windows alias bypass |
+| CVE-2009-3555 | 7.5 HIGH | SSL | TLS renegotiation injection (MITM) |
+| CVE-2009-2629 | 7.5 HIGH | core | Buffer underflow (crash/RCE) |
+| CVE-2009-3896 | 5.0 MEDIUM | core | NULL pointer via long URI (DoS) |
+| CVE-2009-3898 | 4.9 MEDIUM | WebDAV | Traversal via COPY/MOVE (auth) |
+| CVE-2019-9516 | 6.5 MEDIUM | HTTP/2 | 0-length headers leak |
+| CVE-2019-20372 | 5.3 MEDIUM | proxy | Request smuggling (error_page) |
+| CVE-2018-16845 | 6.1 MEDIUM | mp4 | Infinite loop / crash / disclosure |
+| CVE-2024-24990 | 7.5 HIGH | HTTP/3 | Use-after-free (DoS) |
+| CVE-2024-24989 | 7.5 HIGH | HTTP/3 | NULL pointer (DoS) |
+| CVE-2024-31079 | 4.8 MEDIUM | HTTP/3 | Stack overflow / UAF |
+| CVE-2024-32760 | 6.5 MEDIUM | HTTP/3 | Buffer overwrite (HEADERS) |
+| CVE-2024-34161 | 5.3 MEDIUM | HTTP/3 | Memory disclosure (MTU ≥ 4096) |
+| CVE-2024-35200 | 5.3 MEDIUM | HTTP/3 | NULL pointer |
+| CVE-2024-7347 | 4.7 MEDIUM | mp4 | Out-of-bounds read |
+
+---|---|---|---|
 | CVE-2026-42945 | 8.1 HIGH | rewrite | Heap overflow → RCE with ASLR off (**exploited**) |
 | CVE-2026-42946 | 6.5 MEDIUM | scgi/uwsgi | Excessive memory allocation / over-read |
 | CVE-2022-41741 | 7.8 HIGH | mp4 | Memory corruption via malicious mp4 |

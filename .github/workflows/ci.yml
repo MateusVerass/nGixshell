@@ -1,0 +1,31 @@
+name: nGixShell validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Syntax check (3.8-compatible)
+        run: |
+          python3 -m py_compile ngixshell.py calibrate.py test_validation.py testserver.py
+
+      - name: Lint (pyflakes)
+        run: |
+          pip install pyflakes
+          pyflakes ngixshell.py calibrate.py test_validation.py testserver.py
+
+      - name: Run validation suite (38 checks)
+        run: |
+          python3 test_validation.py
