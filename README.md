@@ -5,7 +5,7 @@
 <div align="center">
 
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square&logo=python&logoColor=white)
-![CVEs](https://img.shields.io/badge/CVEs-53-blue?style=flat-square)
+![CVEs](https://img.shields.io/badge/CVEs-61-blue?style=flat-square)
 ![Zero deps](https://img.shields.io/badge/dependencies-none-brightgreen?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey?style=flat-square)
 
@@ -105,7 +105,10 @@ TARGET formats:
 | `--heap-base HEX` / `--libc-base HEX` / `--system-addr HEX` | Manual address overrides |
 | `--build KEY` | Built-in profile (**only** the DepthFirst lab reference is shipped) |
 | `--rewrite-path PATH` | Vulnerable `rewrite` location (default `/api`) |
-| `--spray-path PATH` | `proxy_pass`-backed location used for the POST-body spray (default `/upload`) |
+| `--spray-path PATH` | `proxy_pass`-backed location used for the POST-body spray (default `/upload`; the bundled lab uses `/spray`) |
+| `--spray-mode partial\|full` | `partial`: short body + large Content-Length (bundled lab); `full`: complete body + `X-Delay` (DepthFirst lab) |
+| `--pad-a N` / `--pad-plus N` | Trigger-path padding before the `+` run (defaults `349` / `969`, from the vendor PoC) |
+| `--continue-on-crash` | Keep trying the remaining heap candidates after an unverified crash |
 | `--tries N` / `--spray N` / `--body-len N` | Trigger attempts per candidate / spray connections / spray body size |
 
 ### WAF Detection & Bypass
@@ -254,63 +257,8 @@ Ranges follow <https://nginx.org/en/security_advisories.html>.
 | CVE-2024-34161 | 5.3 MEDIUM | HTTP/3 | Memory disclosure (MTU ≥ 4096) |
 | CVE-2024-35200 | 5.3 MEDIUM | HTTP/3 | NULL pointer |
 | CVE-2024-7347 | 4.7 MEDIUM | mp4 | Out-of-bounds read |
-
----|---|---|---|
-| CVE-2026-42945 | 8.1 HIGH | rewrite | Heap overflow → RCE with ASLR off (**exploited**) |
-| CVE-2026-42946 | 6.5 MEDIUM | scgi/uwsgi | Excessive memory allocation / over-read |
-| CVE-2022-41741 | 7.8 HIGH | mp4 | Memory corruption via malicious mp4 |
-| CVE-2016-1247 | 7.8 HIGH | packaging | Log file symlink privilege escalation |
-| CVE-2021-23017 | 7.7 HIGH | resolver | Off-by-one heap overwrite |
-| CVE-2026-40701 | 4.8 MEDIUM | SSL | ssl_verify_client + ssl_ocsp flaw |
-| CVE-2026-42934 | 4.8 MEDIUM | charset | charset/charset_map + unbuffered proxy_pass |
-| CVE-2026-27784 | 7.8 HIGH | mp4 | Buffer over-read/over-write (32-bit builds) |
-| CVE-2026-32647 | 7.8 HIGH | mp4 | Buffer over-read/over-write |
-| CVE-2024-24990 | 7.5 HIGH | HTTP/3 | Use-after-free in QUIC module |
-| CVE-2024-24989 | 7.5 HIGH | HTTP/3 | NULL pointer dereference in QUIC |
-| CVE-2024-31079 | 7.5 HIGH | HTTP/3 | Stack overflow in QUIC encoder |
-| CVE-2024-32760 | 7.5 HIGH | HTTP/3 | Buffer overwrite via HEADERS frame |
-| CVE-2022-41742 | 7.5 HIGH | mp4 | Heap memory disclosure |
-| CVE-2017-7529 | 7.5 HIGH | range filter | Integer overflow → out-of-bounds read |
-| CVE-2016-0746 | 7.5 HIGH | resolver | Use-after-free via crafted DNS response |
-| CVE-2014-0133 | 7.5 HIGH | SPDY | Heap overflow in SPDY implementation |
-| CVE-2014-0088 | 7.5 HIGH | SPDY | Memory corruption in SPDY |
-| CVE-2013-4547 | 7.5 HIGH | core | Space+NUL URI bypass |
-| CVE-2013-2028 | 7.5 HIGH | core | Chunked encoding stack overflow |
-| CVE-2012-1180 | 7.5 HIGH | proxy | Use-after-free in proxy module |
-| CVE-2009-3555 | 7.5 HIGH | SSL | TLS renegotiation injection (MITM) |
-| CVE-2009-2629 | 7.5 HIGH | core | Buffer underflow in URI parsing |
-| CVE-2026-42926 | 5.8 MEDIUM | HTTP/2 | Frame-header injection (proxy_set_body) |
-| CVE-2026-27654 | 8.2 HIGH | WebDAV | Heap overflow in DAV module |
-| CVE-2026-28753 | 3.7 LOW | mail | CRLF injection via DNS responses (SMTP) |
-| CVE-2026-1642 | 5.9 MEDIUM | proxy | SSL upstream session reuse leak |
-| CVE-2019-9511 | 6.5 MEDIUM | HTTP/2 | Data Dribble CPU/memory DoS |
-| CVE-2012-2089 | 6.8 MEDIUM | mp4 | Buffer overflow via mp4 request |
-| CVE-2018-16845 | 5.5 MEDIUM | mp4 | Integer underflow → crash + disclosure |
-| CVE-2019-20372 | 5.3 MEDIUM | proxy | HTTP request smuggling |
-| CVE-2026-40460 | 6.5 MEDIUM | HTTP/3 | QUIC connection spoofing |
-| CVE-2026-28755 | 5.4 MEDIUM | stream SSL | Revoked-cert handling (OCSP) |
-| CVE-2025-23419 | 4.3 MEDIUM | SSL | TLS session resumption cert bypass |
-| CVE-2024-35200 | 5.3 MEDIUM | HTTP/3 | NULL pointer dereference |
-| CVE-2024-34161 | 5.3 MEDIUM | HTTP/3 | Memory disclosure |
-| CVE-2016-4450 | 5.3 MEDIUM | core | NULL pointer via chunked request body |
-| CVE-2016-0742 | 5.0 MEDIUM | resolver | Invalid pointer via crafted UDP packet |
-| CVE-2016-0747 | 5.0 MEDIUM | resolver | Insufficient CNAME resolution limit |
-| CVE-2014-3556 | 5.0 MEDIUM | mail | STARTTLS command injection |
-| CVE-2013-2070 | 5.3 MEDIUM | proxy | Backend response disclosure |
-| CVE-2011-4963 | 5.0 MEDIUM | access | IPv6 literal access control bypass |
-| CVE-2011-4315 | 5.0 MEDIUM | resolver | Heap overflow via crafted DNS response |
-| CVE-2009-3896 | 5.0 MEDIUM | core | NULL pointer dereference DoS |
-| CVE-2025-53859 | 3.7 LOW | mail | SMTP command injection |
-| CVE-2014-3616 | 4.3 MEDIUM | SSL | TLS SNI virtual host confusion |
-| CVE-2026-27651 | 7.5 HIGH | mail | Worker termination (auth_http) |
-| CVE-2019-9513 | 4.3 MEDIUM | HTTP/2 | Resource Loop CPU DoS |
-| CVE-2019-9516 | 4.3 MEDIUM | HTTP/2 | 0-Length Headers memory exhaustion |
-| CVE-2018-16843 | 4.3 MEDIUM | HTTP/2 | Excessive memory consumption |
-| CVE-2018-16844 | 4.3 MEDIUM | HTTP/2 | Excessive CPU via SETTINGS frames |
-| CVE-2024-7347 | 4.7 MEDIUM | mp4 | Out-of-bounds read |
-| CVE-2009-3898 | 4.9 MEDIUM | WebDAV | Directory traversal via COPY/MOVE |
-
----
+| CVE-2025-53859 | 3.7 LOW | mail | Buffer over-read (SMTP) |
+| CVE-2025-23419 | 4.3 MEDIUM | SSL | SSL session reuse (virtual host confusion) |
 
 ## The Bug (CVE-2026-42945)
 
