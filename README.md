@@ -5,7 +5,7 @@
 <div align="center">
 
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square&logo=python&logoColor=white)
-![CVEs](https://img.shields.io/badge/CVEs-61-blue?style=flat-square)
+![CVEs](https://img.shields.io/badge/CVEs-64-blue?style=flat-square)
 ![Zero deps](https://img.shields.io/badge/dependencies-none-brightgreen?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey?style=flat-square)
 
@@ -13,7 +13,7 @@
 
 ---
 
-**nGixShell** is an nginx CVE scanner and RCE exploit framework. It ships a proof-of-concept for **CVE-2026-42945** (CVSS 3.1 **8.1 HIGH** per F5/NVD) — a heap buffer overflow in `ngx_http_rewrite_module` — and a scanner covering **61 nginx CVEs** with automated HTTP probes, fingerprinting, WAF detection/bypass, web security auditing, and report generation.
+**nGixShell** is an nginx CVE scanner and RCE exploit framework. It ships a proof-of-concept for **CVE-2026-42945** (CVSS 3.1 **8.1 HIGH** per F5/NVD) — a heap buffer overflow in `ngx_http_rewrite_module` — and a scanner covering **64 nginx CVEs** with automated HTTP probes, fingerprinting, WAF detection/bypass, web security auditing, and report generation.
 
 Zero external dependencies. Pure Python 3 stdlib.
 
@@ -91,7 +91,7 @@ TARGET formats:
 | `--verify-url URL` | After a detected crash, fetch URL to confirm the command ran (200 = verified) |
 | `--subdomain-scan DOMAIN` | Find vulnerable nginx on subdomains |
 | `--cve CVE-ID` | Test one specific CVE |
-| `--list-cves` | Print all 61 CVEs with CVSS and probe info |
+| `--list-cves` | Print all 64 CVEs with CVSS and probe info |
 | `--list-candidates` | Print heap address candidates |
 | `--dry-run` | Fingerprint + scan only, no exploit |
 | `--target-file FILE` | Scan multiple hosts from a file |
@@ -192,7 +192,7 @@ pool cleanup pointer — not that code executed.
 
 ## CVE Coverage
 
-61 entries spanning 2009–2026. Scores reflect CVSS v3.1 base metrics from
+64 entries spanning 2009–2026. Scores reflect CVSS v3.1 base metrics from
 NVD/F5 advisories at the time of writing (verify before relying on them for triage).
 Ranges follow <https://nginx.org/en/security_advisories.html>.
 
@@ -247,6 +247,9 @@ Ranges follow <https://nginx.org/en/security_advisories.html>.
 | CVE-2009-2629 | 7.5 HIGH | core | Buffer underflow (crash/RCE) |
 | CVE-2009-3896 | 5.0 MEDIUM | core | NULL pointer via long URI (DoS) |
 | CVE-2009-3898 | 4.9 MEDIUM | WebDAV | Traversal via COPY/MOVE (auth) |
+| CVE-2010-2266 | 5.0 MEDIUM | Windows | Invalid UTF-8 → memory corruption / crash |
+| CVE-2010-2263 | 5.0 MEDIUM | Windows | File default stream → source disclosure |
+| CVE-2009-4487 | 6.8 MEDIUM | core | Error log data not sanitized (hardening) |
 | CVE-2019-9516 | 6.5 MEDIUM | HTTP/2 | 0-length headers leak |
 | CVE-2019-20372 | 5.3 MEDIUM | proxy | Request smuggling (error_page) |
 | CVE-2018-16845 | 6.1 MEDIUM | mp4 | Infinite loop / crash / disclosure |
@@ -374,7 +377,7 @@ Run the suite yourself (no dependencies, uses local fixtures):
 python3 test_validation.py
 ```
 
-Validated on 2026-09-24 (`test_validation.py`, 38 checks):
+Validated on 2026-09-24 (`test_validation.py`, 55 checks):
 
 | Area | Result |
 |---|---|

@@ -14,7 +14,7 @@ BANNER = r"""
 ║/_/ /_/\____/_/_/|_|/____/_/ /_/\___/_/_/              ║
 ╠════════════════════════════════════════════════════════╣
 ║  nginx CVE Scanner + RCE Exploit Framework             ║
-║  61 CVEs  ·  CVE-2026-42945  ·  by Mateus Veras        ║
+║  64 CVEs  ·  CVE-2026-42945  ·  by Mateus Veras        ║
 ╚════════════════════════════════════════════════════════╝
 """
 import argparse
@@ -931,6 +931,36 @@ CVE_DB = OrderedDict([
         "affected_min": (0, 1, 0), "affected_max": (0, 8, 16),
         "fixed_in": "0.8.17+, 0.7.63",
         "config_required": ["dav"],
+        "local_only": False, "probe": None, "exploit": False,
+        "ref": "https://nginx.org/en/security_advisories.html",
+    }),
+    # ── Windows-specific advisories (2010) ─────────────────────────────────────
+    ("CVE-2010-2266", {
+        "description": "Windows: invalid UTF-8 sequence → memory corruption / crash",
+        "cvss": 5.0, "severity": "MEDIUM",
+        "affected_min": (0, 7, 52), "affected_max": (0, 8, 40),
+        "fixed_in": "0.8.41+, 0.7.67+",
+        "config_required": [],
+        "local_only": False, "probe": None, "exploit": False,
+        "windows_only": True,
+        "ref": "https://nginx.org/en/security_advisories.html",
+    }),
+    ("CVE-2010-2263", {
+        "description": "Windows: file default stream → source disclosure",
+        "cvss": 5.0, "severity": "MEDIUM",
+        "affected_min": (0, 7, 52), "affected_max": (0, 8, 39),
+        "fixed_in": "0.8.40+, 0.7.66+",
+        "config_required": [],
+        "local_only": False, "probe": None, "exploit": False,
+        "windows_only": True,
+        "ref": "https://nginx.org/en/security_advisories.html",
+    }),
+    ("CVE-2009-4487", {
+        "description": "Error log data not sanitized (hardening; nginx.org severity: none)",
+        "cvss": 6.8, "severity": "MEDIUM",
+        "affected_min": (0, 1, 0), "affected_max": (99, 99, 99),
+        "fixed_in": "n/a (hardening)",
+        "config_required": [],
         "local_only": False, "probe": None, "exploit": False,
         "ref": "https://nginx.org/en/security_advisories.html",
     }),

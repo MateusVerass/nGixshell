@@ -338,6 +338,25 @@ def main():
           cal["system_addr"] == 0x7ffff77ba000 + 0x50d70 and cal["offsets"] == [0x100, 0x200])
     os.unlink(cal_path)
 
+    # 14b unit: CVE database integrity --------------------------------------
+    check("db: >= 64 CVEs", len(n.CVE_DB) >= 64, f"{len(n.CVE_DB)} entries")
+    for cid in ("CVE-2010-2266", "CVE-2010-2263", "CVE-2009-4487",
+                "CVE-2026-9256", "CVE-2026-42533", "CVE-2026-60005",
+                "CVE-2026-42530", "CVE-2026-42055", "CVE-2026-48142",
+                "CVE-2026-56434", "CVE-2026-90439"):
+        check(f"db: {cid} present", cid in n.CVE_DB)
+
+    def _match(ver, cid):
+        i = n.CVE_DB[cid]
+        return n._version_in_range(ver, i["affected_min"], i["affected_max"],
+                                   i.get("affected2_min"), i.get("affected2_max"))
+
+    check("db: dual range (1.0.10 in CVE-2022-41741)", _match((1, 0, 10), "CVE-2022-41741"))
+    check("db: dual range (1.23.2 not in CVE-2022-41741)", not _match((1, 23, 2), "CVE-2022-41741"))
+    check("db: single-version range (1.26.0 in CVE-2024-31079)", _match((1, 26, 0), "CVE-2024-31079"))
+    check("db: windows range (0.8.40 in CVE-2010-2266)", _match((0, 8, 40), "CVE-2010-2266"))
+    check("db: windows range (0.8.41 not in CVE-2010-2266)", not _match((0, 8, 41), "CVE-2010-2266"))
+
     # 15 unit: html escaping -------------------------------------------------
     with tempfile.TemporaryDirectory() as td:
         evil_fp = {"server_header": "<script>alert(1)</script>", "is_nginx": True}
